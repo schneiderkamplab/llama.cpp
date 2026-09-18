@@ -19,6 +19,8 @@
 #include <random>
 #include <unordered_map>
 #include <stdexcept>
+#include <sstream>
+#include <locale>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
@@ -2382,6 +2384,7 @@ static struct llama_sampler * llama_sampler_xtc_clone(const struct llama_sampler
     {
         auto * result_ctx = (llama_sampler_xtc *) result->ctx;
 
+        result_ctx->seed_cur = ctx->seed_cur;
         result_ctx->rng = ctx->rng;
     }
 
@@ -2502,6 +2505,7 @@ static struct llama_sampler * llama_sampler_mirostat_clone(const struct llama_sa
         auto * result_ctx = (llama_sampler_mirostat *) result->ctx;
 
         result_ctx->mu  = ctx->mu;
+        result_ctx->seed_cur = ctx->seed_cur;
         result_ctx->rng = ctx->rng;
     }
 
@@ -2615,6 +2619,7 @@ static struct llama_sampler * llama_sampler_mirostat_v2_clone(const struct llama
         auto * result_ctx = (llama_sampler_mirostat_v2 *) result->ctx;
 
         result_ctx->mu  = ctx->mu;
+        result_ctx->seed_cur = ctx->seed_cur;
         result_ctx->rng = ctx->rng;
     }
 
@@ -3829,7 +3834,10 @@ static struct llama_sampler * llama_sampler_adaptive_p_clone(const struct llama_
     auto * result     = llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed);
     auto * result_ctx = (llama_sampler_adaptive_p *) result->ctx;
 
-    // copy everything (target, decay, seed, and RNG are already set)
+    // Preserve the complete mutable state, including an advanced RNG.
+    result_ctx->seed_cur          = ctx->seed_cur;
+    result_ctx->rng               = ctx->rng;
+    result_ctx->original_probs    = ctx->original_probs;
     result_ctx->weighted_sum      = ctx->weighted_sum;
     result_ctx->total_weight      = ctx->total_weight;
     result_ctx->pending_token_id  = ctx->pending_token_id;
@@ -4382,4 +4390,234 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+}
+
+// Host sampler snapshots. Configuration is checked before committing a cloned state.
+// Unsupported/custom samplers fail explicitly rather than silently resetting randomness.
+namespace {
+struct sampler_state_io {
+    std::vector<uint8_t> bytes;
+    const uint8_t * src = nullptr;
+    size_t left = 0;
+    bool reading = false;
+
+    template<typename T> void value(T & v) {
+        if (reading) {
+            if (left < sizeof(T)) { throw std::runtime_error("truncated sampler state"); }
+            std::memcpy(&v, src, sizeof(T)); src += sizeof(T); left -= sizeof(T);
+        } else {
+            const auto * p = reinterpret_cast<const uint8_t *>(&v);
+            bytes.insert(bytes.end(), p, p + sizeof(T));
+        }
+    }
+    void value(bool & v) {
+        uint8_t byte = v ? 1 : 0;
+        value(byte);
+        if (byte > 1) { throw std::runtime_error("invalid sampler boolean"); }
+        v = byte != 0;
+    }
+    template<typename T> void config(const T & expected) {
+        T saved = expected; value(saved);
+        if (std::memcmp(&saved, &expected, sizeof(T))) { throw std::runtime_error("sampler configuration mismatch"); }
+    }
+    template<typename T> void vector(std::vector<T> & values) {
+        uint64_t size = values.size(); value(size);
+        if (reading) {
+            if (size > left / sizeof(T)) { throw std::runtime_error("invalid sampler vector size"); }
+            values.resize(size);
+        }
+        for (auto & v : values) { value(v); }
+    }
+    void text(std::string & v) {
+        std::vector<char> chars(v.begin(), v.end()); vector(chars);
+        if (reading) { v.assign(chars.begin(), chars.end()); }
+    }
+    void rng(std::mt19937 & rng) {
+        std::ostringstream output; output.imbue(std::locale::classic()); output << rng;
+        std::string state = output.str(); text(state);
+        if (reading) {
+            std::istringstream input(state); input.imbue(std::locale::classic());
+            if (!(input >> rng)) { throw std::runtime_error("invalid sampler RNG state"); }
+            input >> std::ws;
+            if (!input.eof()) { throw std::runtime_error("trailing sampler RNG data"); }
+        }
+    }
+    void history(llama_sampler * sampler, ring_buffer<llama_token> & prev) {
+        auto tokens = prev.to_vector(); vector(tokens);
+        if (reading) {
+            if (tokens.size() > prev.capacity) { throw std::runtime_error("sampler history exceeds capacity"); }
+            llama_sampler_reset(sampler);
+            for (auto token : tokens) { llama_sampler_accept(sampler, token); }
+        }
+    }
+};
+
+void sampler_state_transfer(llama_sampler * sampler, sampler_state_io & io) {
+    const char * sampler_name = sampler ? llama_sampler_name(sampler) : "null";
+    std::string name = sampler_name ? sampler_name : "unnamed";
+    if (!name.empty() && (name.front() == '+' || name.front() == '-')) { name.erase(0, 1); }
+    auto saved_name = name; io.text(saved_name);
+    if (saved_name != name) { throw std::runtime_error("sampler type mismatch"); }
+    if (!sampler) { return; }
+    const auto * type = sampler->iface;
+    if (type == &llama_sampler_chain_i) {
+        const int32_t count = llama_sampler_chain_n(sampler); io.config(count);
+        for (int32_t i = 0; i < count; ++i) { sampler_state_transfer(llama_sampler_chain_get(sampler, i), io); }
+    } else if (type == &llama_sampler_empty_i || type == &llama_sampler_greedy_i || type == &llama_sampler_infill_i) {
+        // No persistent mutable state. Infill requires the same vocabulary, like model KV snapshots.
+    } else if (type == &llama_sampler_dist_i) {
+        auto & s = *static_cast<llama_sampler_dist *>(sampler->ctx);
+        io.config(s.seed); io.value(s.seed_cur); io.rng(s.rng);
+        io.rng(s.rng_backend);
+        io.value(s.n_backend_draws_generated); io.value(s.n_backend_draws_committed);
+        if (s.n_backend_draws_committed > s.n_backend_draws_generated) { throw std::runtime_error("invalid backend draw counters"); }
+    } else if (type == &llama_sampler_top_k_i) {
+        io.config(static_cast<llama_sampler_top_k *>(sampler->ctx)->k);
+    } else if (type == &llama_sampler_top_p_i) {
+        const auto & s = *static_cast<llama_sampler_top_p *>(sampler->ctx); io.config(s.p); io.config(s.min_keep);
+    } else if (type == &llama_sampler_min_p_i) {
+        const auto & s = *static_cast<llama_sampler_min_p *>(sampler->ctx); io.config(s.p); io.config(s.min_keep);
+    } else if (type == &llama_sampler_typical_i) {
+        const auto & s = *static_cast<llama_sampler_typical *>(sampler->ctx); io.config(s.p); io.config(s.min_keep);
+    } else if (type == &llama_sampler_temp_i) {
+        io.config(static_cast<llama_sampler_temp *>(sampler->ctx)->temp);
+    } else if (type == &llama_sampler_temp_ext_i) {
+        const auto & s = *static_cast<llama_sampler_temp_ext *>(sampler->ctx);
+        io.config(s.temp); io.config(s.delta); io.config(s.exponent);
+    } else if (type == &llama_sampler_top_n_sigma_i) {
+        io.config(static_cast<llama_sampler_top_n_sigma *>(sampler->ctx)->n);
+    } else if (type == &llama_sampler_xtc_i) {
+        auto & s = *static_cast<llama_sampler_xtc *>(sampler->ctx);
+        io.config(s.probability); io.config(s.threshold); io.config(s.min_keep); io.config(s.seed);
+        io.value(s.seed_cur); io.rng(s.rng);
+    } else if (type == &llama_sampler_mirostat_i) {
+        auto & s = *static_cast<llama_sampler_mirostat *>(sampler->ctx);
+        io.config(s.n_vocab); io.config(s.seed); io.config(s.tau); io.config(s.eta); io.config(s.m);
+        io.value(s.seed_cur); io.value(s.mu); io.rng(s.rng);
+    } else if (type == &llama_sampler_mirostat_v2_i) {
+        auto & s = *static_cast<llama_sampler_mirostat_v2 *>(sampler->ctx);
+        io.config(s.seed); io.config(s.tau); io.config(s.eta);
+        io.value(s.seed_cur); io.value(s.mu); io.rng(s.rng);
+    } else if (type == &llama_sampler_adaptive_p_i) {
+        auto & s = *static_cast<llama_sampler_adaptive_p *>(sampler->ctx);
+        io.config(s.target); io.config(s.decay); io.config(s.seed);
+        io.value(s.seed_cur); io.rng(s.rng); io.value(s.weighted_sum); io.value(s.total_weight);
+        io.vector(s.original_probs); io.value(s.pending_token_id); io.value(s.pending_token_idx);
+    } else if (type == &llama_sampler_penalties_i) {
+        auto & s = *static_cast<llama_sampler_penalties *>(sampler->ctx);
+        io.config(s.n_vocab); io.config(s.penalty_last_n); io.config(s.penalty_repeat); io.config(s.penalty_freq); io.config(s.penalty_present);
+        io.history(sampler, s.prev);
+    } else if (type == &llama_sampler_dry_i) {
+        auto & s = *static_cast<llama_sampler_dry *>(sampler->ctx);
+        io.config(s.dry_multiplier); io.config(s.dry_base); io.config(s.dry_allowed_length); io.config(s.dry_penalty_last_n);
+        std::vector<std::pair<llama_token, std::vector<llama_token>>> breakers(s.dry_processed_breakers.begin(), s.dry_processed_breakers.end());
+        std::sort(breakers.begin(), breakers.end());
+        io.config(uint64_t(breakers.size()));
+        for (const auto & entry : breakers) {
+            io.config(entry.first); io.config(uint64_t(entry.second.size()));
+            for (auto token : entry.second) { io.config(token); }
+        }
+        io.history(sampler, s.last_tokens);
+    } else if (type == &llama_sampler_grammar_i) {
+        auto & s = *static_cast<llama_sampler_grammar *>(sampler->ctx);
+        auto config_text = [&](const std::string & expected) {
+            auto saved = expected; io.text(saved);
+            if (saved != expected) { throw std::runtime_error("grammar configuration mismatch"); }
+        };
+        config_text(s.grammar_str); config_text(s.grammar_root);
+        io.config(bool(s.grammar));
+        if (!s.grammar) { return; }
+        auto & g = *s.grammar;
+        io.config(g.lazy);
+        io.config(uint64_t(g.trigger_tokens.size()));
+        for (auto token : g.trigger_tokens) { io.config(token); }
+        io.config(uint64_t(g.trigger_patterns.size()));
+        for (const auto & pattern : g.trigger_patterns) { config_text(pattern.pattern); }
+        io.value(g.awaiting_trigger); io.text(g.trigger_buffer);
+        io.value(g.partial_utf8.value); io.value(g.partial_utf8.n_remain);
+        if (g.partial_utf8.n_remain < -1 || g.partial_utf8.n_remain > 3) { throw std::runtime_error("invalid grammar UTF-8 state"); }
+        uint64_t positions = g.trigger_buffer_positions.size(); io.value(positions);
+        if (io.reading) {
+            if (positions > io.left / (sizeof(llama_token) + 2*sizeof(size_t))) { throw std::runtime_error("invalid trigger positions"); }
+            g.trigger_buffer_positions.resize(positions);
+        }
+        for (auto & entry : g.trigger_buffer_positions) {
+            io.value(entry.first); io.value(entry.second.first); io.value(entry.second.second);
+            if (entry.first < 0 || (s.vocab && entry.first >= int(s.vocab->n_tokens())) ||
+                entry.second.first > entry.second.second || entry.second.second > g.trigger_buffer.size()) {
+                throw std::runtime_error("invalid grammar trigger position");
+            }
+        }
+        std::map<const llama_grammar_element *, std::pair<uint32_t, uint32_t>> offsets;
+        for (uint32_t r = 0; r < g.rules.size(); ++r) {
+            for (uint32_t e = 0; e < g.rules[r].size(); ++e) { offsets[&g.rules[r][e]] = {r, e}; }
+        }
+        uint64_t count = g.stacks.size(); io.value(count);
+        if (io.reading) {
+            if (count > io.left / sizeof(uint64_t)) { throw std::runtime_error("invalid grammar stacks"); }
+            g.stacks.resize(count);
+        }
+        for (auto & stack : g.stacks) {
+            uint64_t size = stack.size(); io.value(size);
+            if (io.reading) {
+                if (size > io.left / (2*sizeof(uint32_t))) { throw std::runtime_error("invalid grammar stack"); }
+                stack.resize(size);
+            }
+            for (auto & element : stack) {
+                auto offset = io.reading ? std::make_pair(0u, 0u) : offsets.at(element);
+                io.value(offset.first); io.value(offset.second);
+                if (offset.first >= g.rules.size() || offset.second >= g.rules[offset.first].size()) {
+                    throw std::runtime_error("invalid grammar rule offset");
+                }
+                if (io.reading) { element = &g.rules[offset.first][offset.second]; }
+            }
+        }
+    } else if (type == &llama_sampler_logit_bias_i) {
+        const auto & s = *static_cast<llama_sampler_logit_bias *>(sampler->ctx);
+        io.config(s.n_vocab); io.config(uint64_t(s.logit_bias.size()));
+        for (const auto & bias : s.logit_bias) { io.config(bias.token); io.config(bias.bias); }
+    } else {
+        throw std::runtime_error("sampler does not support persistent state: " + name);
+    }
+}
+
+std::vector<uint8_t> sampler_state_save(llama_sampler * sampler) {
+    sampler_state_io io;
+    io.config(uint32_t(0x53504d32));
+    sampler_state_transfer(sampler, io);
+    return std::move(io.bytes);
+}
+}
+
+size_t llama_sampler_state_get_size(llama_sampler * sampler) {
+    try { return sampler_state_save(sampler).size(); }
+    catch (const std::exception & e) { LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what()); return 0; }
+}
+
+size_t llama_sampler_state_get_data(llama_sampler * sampler, uint8_t * dst, size_t size) {
+    try {
+        auto bytes = sampler_state_save(sampler);
+        if (!dst || size < bytes.size()) { return 0; }
+        std::memcpy(dst, bytes.data(), bytes.size()); return bytes.size();
+    } catch (const std::exception & e) { LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what()); return 0; }
+}
+
+size_t llama_sampler_state_set_data(llama_sampler * sampler, const uint8_t * src, size_t size) {
+    llama_sampler * copy = nullptr;
+    try {
+        if (!src || !size) { return 0; }
+        // Check support before cloning an arbitrary user-provided sampler.
+        sampler_state_save(sampler);
+        copy = sampler ? llama_sampler_clone(sampler) : nullptr;
+        sampler_state_io io; io.src = src; io.left = size; io.reading = true;
+        io.config(uint32_t(0x53504d32));
+        sampler_state_transfer(copy, io);
+        if (io.left) { throw std::runtime_error("trailing sampler state data"); }
+        if (sampler) { llama_sampler_copy(copy, sampler); }
+        llama_sampler_free(copy);
+        return size;
+    } catch (const std::exception & e) {
+        llama_sampler_free(copy);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what()); return 0;
+    }
 }

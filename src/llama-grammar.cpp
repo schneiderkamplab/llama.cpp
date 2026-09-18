@@ -1404,6 +1404,7 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
         if (std::find(grammar.trigger_tokens.begin(), grammar.trigger_tokens.end(), token) != grammar.trigger_tokens.end()) {
             grammar.awaiting_trigger = false;
             grammar.trigger_buffer.clear();
+            grammar.trigger_buffer_positions.clear();
             llama_grammar_accept_token(grammar, token, piece);
             LLAMA_LOG_DEBUG("Grammar triggered on token %u (`%s`)", token, piece.c_str());
             return;

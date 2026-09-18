@@ -124,6 +124,11 @@ struct common_sampler_deleter {
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
 
+// Host persistence for the common sampler. Empty/false means unsupported or invalid;
+// Includes grammar, reasoning-budget state and backend RNG/history; synchronize attached contexts first.
+std::vector<uint8_t> common_sampler_state_save(struct common_sampler * sampler);
+bool common_sampler_state_load(struct common_sampler * sampler, const std::vector<uint8_t> & data);
+
 bool common_sampler_uses_backend(const common_sampler * sampler);
 
 // Sample a restored boundary row using an unattached host sampler.

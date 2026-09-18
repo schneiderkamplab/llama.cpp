@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -1711,6 +1712,43 @@ static void test_backend_multi_sequence_multi_output_dist(const test_params & pa
     printf("backend multi-sequence multi-output dist test PASSED\n");
 }
 
+static void test_host_sampler_persistence(const test_params & params) {
+    auto * model = params.model.get();
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto require = [](bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } };
+        for (int kind = 0; kind < 4; ++kind) {
+            common_params_sampling sp;
+            sp.seed = 123; sp.temp = 0.8f;
+            sp.penalty_repeat = 1.1f; sp.penalty_last_n = 16;
+            if (kind == 1) { sp.mirostat = 2; sp.seed = LLAMA_DEFAULT_SEED; }
+            if (kind == 2) { sp.adaptive_target = 0.2f; sp.samplers.push_back(COMMON_SAMPLER_TYPE_ADAPTIVE_P); }
+            if (kind == 3) { sp.dry_multiplier = 0.5f; sp.xtc_probability = 0.2f; }
+            common_sampler_ptr sampler(common_sampler_init(model, sp));
+            auto draw = [&](common_sampler * target) {
+                std::vector<llama_token_data> candidates;
+                for (int i = 0; i < n_vocab; ++i) { candidates.push_back({i, std::sin(float(i)), 0.0f}); }
+                llama_token_data_array cur{candidates.data(), candidates.size(), -1, false};
+                llama_sampler_apply(common_sampler_get(target), &cur);
+                const auto token = cur.data[cur.selected].id;
+                common_sampler_accept(target, token, true);
+                return token;
+            };
+            for (int i = 0; i < 7; ++i) { draw(sampler.get()); }
+            const auto state = common_sampler_state_save(sampler.get());
+            require(!state.empty(), "sampler state supported");
+            std::vector<llama_token> continuation;
+            for (int i = 0; i < 20; ++i) { continuation.push_back(draw(sampler.get())); }
+            common_sampler_ptr restored(common_sampler_init(model, sp));
+            require(common_sampler_state_load(restored.get(), state), "sampler state round trip");
+            require(common_sampler_get_seed(restored.get()) == common_sampler_get_seed(sampler.get()), "sampler resolved seed preserved");
+            for (auto token : continuation) { require(draw(restored.get()) == token, "stochastic continuation including sampler history"); }
+            auto truncated = state; truncated.pop_back();
+            require(!common_sampler_state_load(restored.get(), truncated), "truncated sampler rejected atomically");
+            require(draw(restored.get()) == draw(sampler.get()), "failed sampler restore preserves random stream");
+        }
+    printf("host sampler persistence test PASSED\n");
+}
+
 static void test_backend_multi_output_dist_transaction(const test_params & params) {
     const llama_seq_id seq_id = 0;
     const uint32_t seed = 95;
@@ -1752,7 +1790,7 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     auto decode = [&]() {
         llama_batch batch = llama_batch_init(3, 0, 1);
         for (int32_t i = 0; i < 3; ++i) {
-            common_batch_add(batch, llama_vocab_bos(vocab), pos++, { seq_id }, true);
+            common_batch_add(batch, llama_vocab_bos(vocab) == LLAMA_TOKEN_NULL ? 0 : llama_vocab_bos(vocab), pos++, { seq_id }, true);
         }
         GGML_ASSERT(llama_decode(test_ctx.ctx.get(), batch) == 0);
         return batch;
@@ -1768,11 +1806,17 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     llama_batch_free(batch);
 
     batch = decode();
-    llama_sampler_ptr saved(llama_sampler_clone(chain.get()));
+    llama_synchronize(test_ctx.ctx.get());
+    std::vector<uint8_t> saved(llama_sampler_state_get_size(chain.get()));
+    GGML_ASSERT(!saved.empty());
+    GGML_ASSERT(llama_sampler_state_get_data(chain.get(), saved.data(), saved.size()) == saved.size());
     verify_random(0, randoms[2]);
     llama_batch_free(batch);
 
-    llama_sampler_copy(saved.get(), chain.get());
+    GGML_ASSERT(llama_sampler_state_set_data(chain.get(), saved.data(), saved.size()) == saved.size());
+    // Restore into a live graph-bound chain; graph tensor bindings must survive.
+    auto truncated = saved; truncated.pop_back();
+    GGML_ASSERT(llama_sampler_state_set_data(chain.get(), truncated.data(), truncated.size()) == 0);
 
     batch = decode();
     verify_random(0, randoms[2]);
@@ -2012,6 +2056,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "set_sampler",     test_backend_set_sampler,             true  },
     { "multi_output_limit",    test_backend_multi_output_limit,      true },
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
+    { "host_persistence", test_host_sampler_persistence, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
     { "multi_output_sampling_chain", test_backend_multi_output_sampling_chain, true },
     { "multi_output_cpu",      test_backend_multi_output_cpu_suffix, true },

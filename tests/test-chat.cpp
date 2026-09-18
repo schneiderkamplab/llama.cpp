@@ -10,6 +10,10 @@
 #include "../tools/server/server-chat.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
+#ifdef LLAMA_TEST_SERVER_STATE
+#include "../tools/server/server-task.h"
+#include "chat-peg-parser.h"
+#endif
 #include "common.h"
 #include "ggml.h"
 #include "log.h"
@@ -7320,7 +7324,61 @@ static void test_msg_diffs_compute() {
     }
 }
 
+#ifdef LLAMA_TEST_SERVER_STATE
+static void test_parser_continuation() {
+    common_chat_parser_params params;
+    params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    const auto tools = json::parse(R"([{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
+    params.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto reasoning = p.optional("<think>" + p.reasoning(p.until("</think>")) + "</think>");
+        auto tool = p.standard_json_tools("<tool_call>[", "]</tool_call>", tools, false, false);
+        return p.sequence({reasoning, p.content(p.until("<tool_call>")), p.optional(tool), p.end()});
+    });
+    const std::string text = R"(<think>Check city</think>Looking up<tool_call>[{"name":"weather","arguments":{"city":"Odense"}}]</tool_call>)";
+    // Split within reasoning, the closing delimiter, plain content and tool arguments.
+    for (size_t split : {size_t(10), size_t(21), size_t(29), size_t(85)}) {
+        task_result_state live(params), restored(params);
+        live.prime_resume("", "stable");
+        std::vector<common_chat_msg_diff> ignored, expected, actual;
+        live.update_chat_msg(text.substr(0, split), true, ignored);
+        restored.prime_resume(text.substr(0, split), "stable");
+        const auto a = live.update_chat_msg(text.substr(split), false, expected);
+        const auto b = restored.update_chat_msg(text.substr(split), false, actual);
+        GGML_ASSERT(a == b && a.tool_calls.size() == 1 && a.tool_calls[0].id == "call_stable_0");
+        GGML_ASSERT(expected.size() == actual.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            GGML_ASSERT(expected[i].content_delta == actual[i].content_delta);
+            GGML_ASSERT(expected[i].reasoning_content_delta == actual[i].reasoning_content_delta);
+            GGML_ASSERT(expected[i].tool_call_index == actual[i].tool_call_index);
+            GGML_ASSERT(expected[i].tool_call_delta.arguments == actual[i].tool_call_delta.arguments);
+            GGML_ASSERT(expected[i].tool_call_delta.name == actual[i].tool_call_delta.name);
+            GGML_ASSERT(expected[i].tool_call_delta.id == actual[i].tool_call_delta.id);
+        }
+    }
+    task_result_state state(params);
+    server_task_result_cmpl_partial chunk;
+    chunk.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    chunk.parser_seed = "stable";
+    chunk.parser_prefix = text.substr(0, 85);
+    chunk.content = text.substr(85);
+    chunk.n_decoded = 1;
+    chunk.update(state);
+    const auto events = chunk.to_json().dump();
+    GGML_ASSERT(events.find("response.output_item.added") != std::string::npos);
+    GGML_ASSERT(events.find("call_stable_0") != std::string::npos);
+    GGML_ASSERT(events.find("weather") != std::string::npos);
+    std::cout << "Parser continuation: 4 split cases and Responses tool stream passed\n";
+}
+#endif
+
 int main(int argc, char ** argv) {
+#ifdef LLAMA_TEST_SERVER_STATE
+    if (argc == 2 && std::string(argv[1]) == "--parser-continuation") {
+        test_parser_continuation();
+        return 0;
+    }
+#endif
     bool detailed_debug    = false;
     bool only_run_filtered = false;
 

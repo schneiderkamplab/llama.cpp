@@ -50,3 +50,7 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// Versioned snapshot; restore requires identical delimiter and budget configuration.
+std::vector<uint8_t> common_reasoning_budget_state_save(const llama_sampler * smpl);
+bool common_reasoning_budget_state_load(llama_sampler * smpl, const std::vector<uint8_t> & data);

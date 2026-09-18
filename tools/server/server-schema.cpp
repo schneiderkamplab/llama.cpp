@@ -28,6 +28,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ->set_desc("Whether to include usage information in the stream"))
         ->set_desc("Additional options for streaming responses"));
 
+    add((new field_bool("retain_state", params.retain_state))
+        ->set_desc("Text decoder completion: retain generation state at a token-limit stop for explicit resumption"));
+    add((new field_bool("resume", params.resume))
+        ->set_desc("Text decoder completion: resume id_slot with the original prompt and sampling settings"));
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 

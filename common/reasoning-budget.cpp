@@ -1,6 +1,7 @@
 #include "reasoning-budget.h"
 #include "common.h"
 #include "trie.h"
+#include "nlohmann/json.hpp"
 #include "unicode.h"
 
 #include "log.h"
@@ -307,4 +308,46 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     COM_TRC("%s", "forced into forcing state (manual transition)\n");
 
     return true;
+}
+
+static nlohmann::json reasoning_budget_config(const common_reasoning_budget_ctx & ctx) {
+    return {ctx.start_matcher.seqs, ctx.end_matcher.seqs, ctx.forced_tokens, ctx.budget};
+}
+
+std::vector<uint8_t> common_reasoning_budget_state_save(const llama_sampler * smpl) {
+    if (!smpl) { return {}; }
+    const auto & ctx = *static_cast<const common_reasoning_budget_ctx *>(smpl->ctx);
+    return nlohmann::json::to_cbor(nlohmann::json{
+        {"version", 1}, {"config", reasoning_budget_config(ctx)},
+        {"start", ctx.start_matcher.state}, {"end", ctx.end_matcher.state},
+        {"remaining", ctx.remaining}, {"phase", int(ctx.state)},
+        {"force_pos", ctx.force_pos}, {"end_match", ctx.end_match}});
+}
+
+bool common_reasoning_budget_state_load(llama_sampler * smpl, const std::vector<uint8_t> & data) {
+    if (!smpl) { return data.empty(); }
+    try {
+        auto & ctx = *static_cast<common_reasoning_budget_ctx *>(smpl->ctx);
+        const auto j = nlohmann::json::from_cbor(data);
+        if (j.at("version") != 1 || j.at("config") != reasoning_budget_config(ctx)) { return false; }
+        const auto start = j.at("start").get<uint64_t>();
+        const auto end = j.at("end").get<uint64_t>();
+        const auto remaining = j.at("remaining").get<int64_t>();
+        const auto phase = j.at("phase").get<int64_t>();
+        const auto pos = j.at("force_pos").get<uint64_t>();
+        const auto match = j.at("end_match").get<int64_t>();
+        if (start >= ctx.start_matcher.ac.num_states() || end >= ctx.end_matcher.ac.num_states() ||
+            remaining < std::min(0, ctx.budget) || remaining > std::max(0, ctx.budget) ||
+            phase < REASONING_BUDGET_IDLE || phase > REASONING_BUDGET_DONE ||
+            pos > ctx.forced_tokens.size() || match < -1 || match >= int64_t(ctx.end_matcher.seqs.size())) {
+            return false;
+        }
+        ctx.start_matcher.state = start;
+        ctx.end_matcher.state = end;
+        ctx.remaining = remaining;
+        ctx.state = static_cast<common_reasoning_budget_state>(phase);
+        ctx.force_pos = pos;
+        ctx.end_match = match;
+        return true;
+    } catch (const std::exception &) { return false; }
 }

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "fit.h"
+#include "nlohmann/json.hpp"
 #include "log.h"
 #include "reasoning-budget.h"
 
@@ -934,6 +935,48 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
 }
 
 
+static std::vector<uint8_t> sampler_snapshot(llama_sampler * sampler) {
+    std::vector<uint8_t> data(llama_sampler_state_get_size(sampler));
+    if (data.empty() || llama_sampler_state_get_data(sampler, data.data(), data.size()) != data.size()) {
+        throw std::runtime_error("unsupported sampler snapshot");
+    }
+    return data;
+}
+
 bool common_sampler_uses_backend(const common_sampler * sampler) {
     return sampler && sampler->params.backend_sampling;
+}
+
+std::vector<uint8_t> common_sampler_state_save(common_sampler * sampler) {
+    if (!sampler) { return {}; }
+    try {
+        return nlohmann::json::to_cbor(nlohmann::json{
+            {"version", 2}, {"prev", sampler->prev.to_vector()},
+            {"grammar", sampler_snapshot(sampler->grmr)},
+            {"reasoning", common_reasoning_budget_state_save(sampler->rbudget)},
+            {"chain", sampler_snapshot(sampler->chain)}});
+    } catch (const std::exception &) { return {}; }
+}
+
+bool common_sampler_state_load(common_sampler * sampler, const std::vector<uint8_t> & data) {
+    if (!sampler || common_sampler_state_save(sampler).empty()) { return false; }
+    try {
+        const auto j = nlohmann::json::from_cbor(data);
+        if (j.at("version") != 2) { return false; }
+        const auto prev = j.at("prev").get<llama_tokens>();
+        const auto grammar = j.at("grammar").get<std::vector<uint8_t>>();
+        const auto reasoning = j.at("reasoning").get<std::vector<uint8_t>>();
+        const auto chain = j.at("chain").get<std::vector<uint8_t>>();
+        if (prev.size() > sampler->prev.capacity) { return false; }
+        common_sampler_ptr copy(common_sampler_clone(sampler));
+        if (!llama_sampler_state_set_data(copy->grmr, grammar.data(), grammar.size()) ||
+            !common_reasoning_budget_state_load(copy->rbudget, reasoning) ||
+            !llama_sampler_state_set_data(copy->chain, chain.data(), chain.size())) { return false; }
+        copy->prev.clear();
+        for (auto token : prev) { copy->prev.push_back(token); }
+        copy->cur.clear();
+        copy->cur_p = {};
+        common_sampler_copy(copy.get(), sampler);
+        return true;
+    } catch (const std::exception &) { return false; }
 }

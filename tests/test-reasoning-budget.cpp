@@ -358,6 +358,46 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
+static void test_persistence() {
+    auto make = [] { return common_reasoning_budget_init(nullptr, {{10, 11}}, {{20, 21}}, {30, 20, 21}, 4); };
+    for (auto phase : {REASONING_BUDGET_IDLE, REASONING_BUDGET_COUNTING, REASONING_BUDGET_FORCING,
+                       REASONING_BUDGET_WAITING_UTF8, REASONING_BUDGET_DONE}) {
+        auto * source = common_reasoning_budget_init(nullptr, {{10, 11}}, {{20, 21}}, {30, 20, 21}, 4, phase);
+        auto * restored = make();
+        GGML_ASSERT(common_reasoning_budget_state_load(restored, common_reasoning_budget_state_save(source)));
+        llama_sampler_accept(source, 30);
+        llama_sampler_accept(restored, 30);
+        GGML_ASSERT(common_reasoning_budget_state_save(source) == common_reasoning_budget_state_save(restored));
+        llama_sampler_free(source);
+        llama_sampler_free(restored);
+    }
+    auto * source = make();
+    // Partial start/end delimiters, counting, manual forcing, partial forcing, DONE and re-arm.
+    size_t step = 0;
+    for (auto token : {10, 11, 40, 20, 21, 10, 11, 30, 20, 21}) {
+        llama_sampler_accept(source, token);
+        if (token == 11 && step > 4) { common_reasoning_budget_force(source); }
+        ++step;
+        auto state = common_reasoning_budget_state_save(source);
+        auto * restored = make();
+        GGML_ASSERT(common_reasoning_budget_state_load(restored, state));
+        GGML_ASSERT(common_reasoning_budget_state_save(restored) == state);
+        auto truncated = state; truncated.pop_back();
+        GGML_ASSERT(!common_reasoning_budget_state_load(restored, truncated));
+        GGML_ASSERT(common_reasoning_budget_state_save(restored) == state);
+        for (auto next : {30, 20, 21, 10, 11}) {
+            auto * expected = llama_sampler_clone(source);
+            llama_sampler_accept(expected, next);
+            llama_sampler_accept(restored, next);
+            GGML_ASSERT(common_reasoning_budget_state_save(restored) == common_reasoning_budget_state_save(expected));
+            llama_sampler_free(expected);
+            GGML_ASSERT(common_reasoning_budget_state_load(restored, state));
+        }
+        llama_sampler_free(restored);
+    }
+    llama_sampler_free(source);
+}
+
 int main(void) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
@@ -490,6 +530,7 @@ int main(void) {
             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
     }
 
+    test_persistence();
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();

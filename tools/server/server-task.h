@@ -50,6 +50,8 @@ enum stop_type {
 struct task_params {
     bool stream          = false;
     bool include_usage   = false;
+    bool retain_state    = false; // retain a resumable generation at a token-limit stop
+    bool resume          = false; // continue a retained/restored generation, not a new prompt
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
@@ -107,6 +109,9 @@ struct task_result_state {
     std::vector<common_chat_msg_diff> diffs;
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
+    bool resume_primed = false;
+    std::string tool_id_seed;
+    void prime_resume(const std::string & prefix, const std::string & seed);
     std::string generated_text; // append new chunks of generated text here
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
@@ -269,6 +274,8 @@ struct result_prompt_progress {
 };
 
 struct server_task_result {
+    std::string parser_prefix;
+    std::string parser_seed;
     int id           = -1;
     int id_slot      = -1;
 
@@ -364,6 +371,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
+        state.prime_resume(parser_prefix, parser_seed);
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         oai_resp_id = state.oai_resp_id;

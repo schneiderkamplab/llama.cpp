@@ -1573,6 +1573,15 @@ extern "C" {
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 
+    // Sampler snapshots, independent of model/KV state, including built-in grammar and backend RNG/history.
+    // Recreate the same configuration and vocabulary before loading. Synchronize any attached context first.
+    // Return 0 for unsupported/custom samplers or invalid data. Invalid data leaves the sampler unchanged.
+    // Restore preserves backend graph bindings; graph outputs are not serialized. Not a cross-version format.
+    LLAMA_API size_t llama_sampler_state_get_size(struct llama_sampler * smpl);
+    LLAMA_API size_t llama_sampler_state_get_data(struct llama_sampler * smpl, uint8_t * dst, size_t size);
+    LLAMA_API size_t llama_sampler_state_set_data(struct llama_sampler * smpl, const uint8_t * src, size_t size);
+
+
     /// @details Sample and accept a token from the idx-th output of the last evaluation
     // For multiple outputs from one sampler, call this function in output order without gaps.
     //

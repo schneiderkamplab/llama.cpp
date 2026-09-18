@@ -2137,3 +2137,22 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+
+### Generation resumption (optional persistence extension)
+
+Ordinary text causal decoders and PrefixLM can set `retain_state: true` with an
+explicit `id_slot` to retain a generation at its token limit. Continue with
+`resume: true`, the original prompt and matching sampling/parser settings, and an
+additional `n_predict` budget. Set `retain_state` again to retain the new boundary.
+A new chat turn is a fresh request.
+
+The native completion and OpenAI Completions, Chat and Responses endpoints support
+this protocol, including built-in grammar, reasoning-budget and backend samplers.
+With `--slot-save-path`, slot save/restore persists KV, sampler state, pending token
+and output/parser bookkeeping across restart and slot remapping. Ordinary prompt/KV
+files keep their existing format but do not contain resumable generations.
+
+See [generation persistence](../../docs/development/generation-persistence.md) for
+matching-configuration requirements, incremental versus cumulative output semantics,
+restrictions and tests.

@@ -159,6 +159,18 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     }
 }
 
+// Parsing is a pure replay of accumulated text. Seed generated tool IDs so replay
+// and fresh-process restore produce the same IDs without serializing parser pointers.
+void task_result_state::prime_resume(const std::string & prefix, const std::string & seed) {
+    if (resume_primed) { return; }
+    resume_primed = true;
+    tool_id_seed = seed;
+    if (!prefix.empty()) {
+        std::vector<common_chat_msg_diff> ignored;
+        update_chat_msg(prefix, true, ignored);
+    }
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
@@ -172,7 +184,10 @@ common_chat_msg task_result_state::update_chat_msg(
         is_partial,
         chat_parser_params);
     if (!new_msg.empty()) {
-        new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        new_msg.set_tool_call_ids(generated_tool_call_ids, [&]() {
+            return tool_id_seed.empty() ? gen_tool_call_id()
+                : "call_" + tool_id_seed + "_" + std::to_string(generated_tool_call_ids.size());
+        });
         chat_msg = new_msg;
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
 
@@ -987,10 +1002,22 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 //
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
+    state.prime_resume(parser_prefix, parser_seed);
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    // A resumed Responses request opens a new transport stream. Reannounce a tool
+    // whose arguments continue, while keeping its logical call ID stable.
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !parser_prefix.empty()) {
+        for (auto & diff : oaicompat_msg_diffs) {
+            const auto index = diff.tool_call_index;
+            if (index < state.chat_msg.tool_calls.size() && state.sent_tool_call_names.insert(index).second) {
+                diff.tool_call_delta.name = state.chat_msg.tool_calls[index].name;
+                diff.tool_call_delta.id = state.chat_msg.tool_calls[index].id;
+            }
+        }
+    }
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;

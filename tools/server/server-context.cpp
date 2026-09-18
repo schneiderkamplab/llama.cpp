@@ -236,6 +236,43 @@ struct server_batch {
     }
 };
 
+static std::vector<uint8_t> sampler_state_bytes(const json & data) {
+    const auto values = data.get<std::vector<int>>();
+    if (!std::all_of(values.begin(), values.end(), [](int x) { return x >= 0 && x <= 255; })) {
+        throw std::runtime_error("invalid sampler bytes");
+    }
+    return {values.begin(), values.end()};
+}
+
+static json generation_resume_settings(const task_params & params) {
+    auto result = params.to_json();
+    for (const char * key : {"max_tokens", "n_predict", "stream", "timings_per_token", "speculative.types"}) {
+        result.erase(key);
+    }
+    // The diagnostic representation uses objects and JSON null for infinity;
+    // persistence needs the request schema's [token, bias] form instead.
+    result["logit_bias"] = json::array();
+    for (const auto & bias : params.sampling.logit_bias) {
+        result["logit_bias"].push_back(json::array({bias.token,
+            bias.bias == -INFINITY ? json(false) : json(bias.bias)}));
+    }
+    const auto & cp = params.chat_parser_params;
+    result["chat_format"] = int(cp.format);
+    result["parser"] = cp.parser.to_json();
+    result["parse_tool_calls"] = cp.parse_tool_calls;
+    result["is_continuation"] = cp.is_continuation;
+    result["echo"] = cp.echo;
+    result["res_type"] = int(params.res_type);
+    auto ends = json::array();
+    for (const auto & end : params.sampling.reasoning_budget_end) { ends.push_back(end); }
+    result["reasoning_state_config"] = json::array({params.sampling.reasoning_budget_tokens,
+        params.sampling.reasoning_budget_start, ends, params.sampling.reasoning_budget_forced, params.sampling.reasoning_control});
+    result["cache_prompt"] = params.cache_prompt;
+    result["n_indent"] = params.n_indent;
+    result["t_max_predict_ms"] = params.t_max_predict_ms;
+    return result;
+}
+
 struct server_slot {
     int id;
 
@@ -295,8 +332,27 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    json resume_state;
     llama_tokens exact_prefix_tokens;
     std::vector<uint8_t> exact_prefix_state;
+    size_t response_start = 0;
+    std::string parser_seed;
+
+    void capture_resume() {
+        if (!task->params.retain_state || stop != STOP_TYPE_LIMIT || !smpl || truncated ||
+            n_predict_max <= 0 || stats.n_gen < n_predict_max || n_sent_text > generated_text.size()) { return; }
+        auto sampler = common_sampler_state_save(smpl.get());
+        if (sampler.empty()) { throw std::runtime_error("sampler cannot be persisted"); }
+        resume_state = {
+            {"version", 3}, {"parser_seed", parser_seed}, {"prompt", prompt.tokens.get_text_tokens()},
+            {"request_prompt", task->tokens.get_text_tokens()},
+            {"sampler", std::vector<int>(sampler.begin(), sampler.end())}, {"pending", sampled},
+            {"settings", generation_resume_settings(task->params)},
+            {"text", generated_text}, {"sent", n_sent_text},
+            {"last_nl", last_nl_pos}, {"has_new_line", has_new_line},
+        };
+    }
+
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -339,6 +395,7 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        resume_state = nullptr;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -375,6 +432,7 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated_text = "";
+        response_start = 0;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -557,7 +615,7 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // Retained generations own their KV until resumed, replaced, or explicitly erased.
-            if (task->is_child() || (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM)) {
+            if (task->is_child() || (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM && resume_state.is_null())) {
                 prompt_clear();
             }
 
@@ -693,6 +751,7 @@ struct server_slot {
 
         res = {
             {"id",            id},
+            {"resume_ready", !resume_state.is_null()},
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
@@ -1588,7 +1647,7 @@ private:
                 }
 
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || (task.id_slot == -1 && !slot.resume_state.is_null())) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
@@ -1636,7 +1695,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || (task.id_slot == -1 && !slot.resume_state.is_null())) {
                     continue;
                 }
 
@@ -1693,7 +1752,7 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || !slot.resume_state.is_null()) {
                 continue;
             }
 
@@ -1726,6 +1785,27 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if ((task.params.retain_state || task.params.resume) &&
+            (!llama_model_has_decoder(model_tgt) || llama_model_has_encoder(model_tgt) || !llama_get_memory(ctx_tgt) ||
+             params_base.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL ||
+             task.tokens.has_mtmd || !task.params.lora.empty() || lora_all_alora(params_base.lora_adapters) ||
+             std::any_of(task.params.speculative.types.begin(), task.params.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; }) ||
+             task.type != SERVER_TASK_TYPE_COMPLETION ||
+             (task.params.res_type != TASK_RESPONSE_TYPE_NONE && task.params.res_type != TASK_RESPONSE_TYPE_OAI_CMPL &&
+              task.params.res_type != TASK_RESPONSE_TYPE_OAI_CHAT && task.params.res_type != TASK_RESPONSE_TYPE_OAI_RESP) ||
+             task.is_child() || task.is_parent() || task.id_slot < 0 || task.id_slot != slot.id)) {
+            send_error(task, "resumption requires a single text decoder completion, explicit id_slot, fixed adapters and no speculation", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        if (task.params.resume) {
+            if (slot.resume_state.is_null() ||
+                task.tokens.get_text_tokens() != slot.resume_state.at("request_prompt").get<llama_tokens>() ||
+                generation_resume_settings(task.params) != slot.resume_state.at("settings")) {
+                send_error(task, "no compatible saved generation: original prompt and sampling settings must match", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
         if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
             const bool speculative = std::any_of(task.params.speculative.types.begin(), task.params.speculative.types.end(),
                 [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
@@ -1817,6 +1897,12 @@ private:
         if (task.need_sampling()) {
             try {
                 common_sampler_ptr sampler(common_sampler_init(model_tgt, task.params.sampling));
+                if ((task.params.retain_state || task.params.resume) && common_sampler_state_save(sampler.get()).empty()) {
+                    throw std::runtime_error("sampler combination does not support persistent resumption");
+                }
+                if (task.params.resume && !common_sampler_state_load(sampler.get(), sampler_state_bytes(slot.resume_state.at("sampler")))) {
+                    throw std::runtime_error("saved sampler state is incompatible");
+                }
                 slot.smpl = std::move(sampler);
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
@@ -1856,14 +1942,34 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
-        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM && !task.params.resume) {
             slot.prompt_clear();
+        }
+        if (!task.params.resume) {
+            // A replacement task must not resurrect an older retained generation.
+            slot.resume_state = nullptr;
         }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+        slot.parser_seed = slot.task->params.resume ? slot.resume_state.at("parser_seed").get<std::string>()
+            : ((slot.task->params.retain_state) ? slot.task->params.oaicompat_cmpl_id : "");
+        if (slot.task->params.resume) {
+            slot.sampled = slot.resume_state.at("pending").get<llama_token>();
+            slot.generated_text = slot.resume_state.at("text").get<std::string>();
+            slot.n_sent_text = slot.resume_state.at("sent").get<size_t>();
+            slot.response_start = slot.n_sent_text;
+            slot.last_nl_pos = slot.resume_state.at("last_nl").get<size_t>();
+            slot.has_new_line = slot.resume_state.at("has_new_line").get<bool>();
+            slot.stats.update_prompt_start();
+            slot.stats.update_prompt_last();
+            slot.stats.n_prompt_cached = slot.prompt.n_tokens();
+            slot.state = SLOT_STATE_GENERATING;
+            slot.resume_state = nullptr; // consumed; cancellation must not resurrect an older snapshot
+        }
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -2115,6 +2221,8 @@ private:
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+        res->parser_seed = slot.parser_seed;
+        res->parser_prefix = slot.generated_text.substr(0, slot.response_start);
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
@@ -2130,6 +2238,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        slot.capture_resume();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2147,7 +2256,9 @@ private:
             res->content     = "";
             res->tokens      = llama_tokens{};
         } else {
-            res->content     = slot.generated_text;
+            const size_t start = std::min(slot.response_start, slot.generated_text.size());
+            const size_t end = slot.resume_state.is_null() ? slot.generated_text.size() : slot.n_sent_text;
+            res->content     = slot.generated_text.substr(start, end - start);
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
@@ -2170,6 +2281,8 @@ private:
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+        res->parser_seed = slot.parser_seed;
+        res->parser_prefix = slot.generated_text.substr(0, slot.response_start);
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
@@ -2293,7 +2406,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && slot.resume_state.is_null() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2483,7 +2596,7 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
+                            if (!slot.is_processing() && slot.resume_state.is_null()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
                                 if (slot.prompt_save(*prompt_cache)) {
@@ -2592,10 +2705,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
-                        send_error(task, "PrefixLM slot files require the optional generation-persistence patch", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2614,19 +2723,38 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM && slot->resume_state.is_null()) {
+                        send_error(task, "slot has no retained generation; use retain_state with a token limit", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     std::vector<char> packed;
                     try {
-                        packed = slot->prompt.tokens.serialize();
+                        if (!slot->resume_state.is_null()) {
+                            const auto text = slot->resume_state.dump();
+                            const uint32_t size = text.size();
+                            // Negative marker cannot collide with ordinary token lists or their -1 envelope.
+                            const int32_t marker = -2;
+                            packed.resize(sizeof(marker) + sizeof(size) + text.size());
+                            std::memcpy(packed.data(), &marker, sizeof(marker));
+                            std::memcpy(packed.data() + sizeof(marker), &size, sizeof(size));
+                            std::memcpy(packed.data() + sizeof(marker) + sizeof(size), text.data(), text.size());
+                            while (packed.size() % sizeof(llama_token)) { packed.push_back(0); }
+                        } else {
+                            packed = slot->prompt.tokens.serialize();
+                        }
                     } catch (const std::exception & err) {
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const bool retained_state = !slot->resume_state.is_null();
+                    const std::string savepath = retained_state ? filepath + ".tmp-" + std::to_string(task.id) : filepath;
                     const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
+                        ctx_tgt, savepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
+                    if (nwrite == 0 || (retained_state && std::rename(savepath.c_str(), filepath.c_str()) != 0)) {
+                        if (retained_state) { std::remove(savepath.c_str()); }
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -2646,10 +2774,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
-                        send_error(task, "PrefixLM slot files require the optional generation-persistence patch", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2674,6 +2798,9 @@ private:
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
+                            if (n_packed > 16 * 1024 * 1024) {
+                                throw std::runtime_error("session metadata exceeds 64 MiB");
+                            }
                             packed.resize(std::max<size_t>(1, n_packed));
                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
                         }
@@ -2682,7 +2809,59 @@ private:
                         }
                         packed.resize(n_packed);
 
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        json restored_resume;
+                        server_tokens restored;
+                        if (!packed.empty() && packed.front() == -2) {
+                            const auto * begin = reinterpret_cast<const char *>(packed.data() + 1);
+                            uint32_t size;
+                            if (packed.size() < 2) { throw std::runtime_error("empty resume metadata"); }
+                            std::memcpy(&size, begin, sizeof(size));
+                            if (size > (packed.size() - 2) * sizeof(llama_token)) {
+                                throw std::runtime_error("truncated resume metadata");
+                            }
+                            restored_resume = json::parse(std::string(begin + sizeof(size), size));
+                            if (restored_resume.at("version").get<int>() != 3) { throw std::runtime_error("invalid resume format"); }
+                            const auto tokens = restored_resume.at("prompt").get<llama_tokens>();
+                            const auto request = restored_resume.at("request_prompt").get<llama_tokens>();
+                            const auto pending = restored_resume.at("pending").get<llama_token>();
+                            const auto text = restored_resume.at("text").get<std::string>();
+                            if (tokens.empty() || request.empty() || request.size() > tokens.size() ||
+                                !std::equal(request.begin(), request.end(), tokens.begin()) ||
+                                pending < 0 || pending >= llama_vocab_n_tokens(vocab) ||
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) != llama_pos(tokens.size() - 1) ||
+                                restored_resume.at("sent").get<size_t>() > text.size() ||
+                                restored_resume.at("last_nl").get<size_t>() > text.size()) {
+                                throw std::runtime_error("invalid generation bookkeeping");
+                            }
+                            restored_resume.at("has_new_line").get<bool>();
+                            auto settings = restored_resume.at("settings");
+                            // Saved logit_bias already contains the ignore-EOS bias from schema evaluation.
+                            settings["ignore_eos"] = false;
+                            auto preserved = json::array();
+                            for (const auto & value : settings.at("preserved_tokens")) {
+                                const auto token = value.get<llama_token>();
+                                if (token < 0 || token >= llama_vocab_n_tokens(vocab)) { throw std::runtime_error("invalid preserved token"); }
+                                preserved.push_back(common_token_to_piece(vocab, token, true));
+                            }
+                            settings["preserved_tokens"] = std::move(preserved);
+                            auto params = server_schema::eval_llama_cmpl_schema(vocab, params_base,
+                                params_base.sampling.logit_bias_eog, settings);
+                            const auto & reasoning = settings.at("reasoning_state_config");
+                            params.sampling.reasoning_budget_tokens = reasoning.at(0).get<int32_t>();
+                            params.sampling.reasoning_budget_start = reasoning.at(1).get<llama_tokens>();
+                            params.sampling.reasoning_budget_end.clear();
+                            for (const auto & end : reasoning.at(2)) { params.sampling.reasoning_budget_end.push_back(end.get<llama_tokens>()); }
+                            params.sampling.reasoning_budget_forced = reasoning.at(3).get<llama_tokens>();
+                            params.sampling.reasoning_control = reasoning.at(4).get<bool>();
+                            restored_resume.at("parser_seed").get<std::string>();
+                            common_sampler_ptr sampler(common_sampler_init(model_tgt, params.sampling));
+                            if (!common_sampler_state_load(sampler.get(), sampler_state_bytes(restored_resume.at("sampler")))) {
+                                throw std::runtime_error("invalid saved sampler");
+                            }
+                            restored.insert(tokens);
+                        } else {
+                            restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        }
 
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
@@ -2694,6 +2873,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->resume_state = std::move(restored_resume);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -2770,6 +2950,12 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
+                    if (std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                            return !slot.resume_state.is_null() || (slot.is_processing() && slot.task->params.retain_state);
+                        })) {
+                        send_error(task, "erase or finish retained generations before changing adapters", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     auto new_loras = construct_lora_list(task.set_lora);
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
