@@ -19,6 +19,9 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    int64_t prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced = {},
+                        llama_seq_id copy_dst = -1) const override;
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -136,6 +139,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool prefix_same(llama_seq_id a, llama_seq_id b, llama_pos end) const override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;

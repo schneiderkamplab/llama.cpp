@@ -185,6 +185,7 @@ extern "C" {
         LLAMA_ATTENTION_TYPE_UNSPECIFIED = -1,
         LLAMA_ATTENTION_TYPE_CAUSAL      = 0,
         LLAMA_ATTENTION_TYPE_NON_CAUSAL  = 1,
+        LLAMA_ATTENTION_TYPE_PREFIX_LM   = 2,
     };
 
     enum llama_flash_attn_type {
@@ -370,7 +371,7 @@ extern "C" {
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
-        enum llama_attention_type    attention_type;    // attention type to use for embeddings
+        enum llama_attention_type    attention_type;    // unspecified selects the model default
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
 
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
@@ -665,6 +666,10 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Returns true if the model supports a bidirectional prompt followed by causal generation.
+    // Unspecified context attention selects PREFIX_LM for these models.
+    LLAMA_API bool llama_model_is_prefix_lm(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -710,6 +715,8 @@ extern "C" {
     // The following functions operate on a llama_context, hence the naming: llama_verb_...
 
     // Set LoRa adapters on the context. Will only modify if the adapters currently in context are different.
+    // PrefixLM permits fixed ordinary LoRA: clear all dependent KV before changing weights/scales.
+    // Reapplying the same configuration is allowed. Activated LoRA is not supported.
     LLAMA_API int32_t llama_set_adapters_lora(
             struct llama_context * ctx,
             struct llama_adapter_lora ** adapters,
@@ -742,6 +749,7 @@ extern "C" {
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
+    // PrefixLM permits full removal or a causal answer suffix; it rejects prefix edits and answer holes.
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
@@ -754,6 +762,10 @@ extern "C" {
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
+    // PrefixLM replaces the destination with source [0, p1), which must contain its complete prefix.
+    // For p0 > 0, destination [0, p0) must already share identical KV with the source (unified KV).
+    // A shortened copy invalidates boundary logits; empty ranges and self-copy are no-ops.
+    // Rejected ranges/capacity leave both sequences unchanged. Self-copy is a no-op.
     LLAMA_API void llama_memory_seq_cp(
             llama_memory_t mem,
               llama_seq_id seq_id_src,
@@ -806,6 +818,14 @@ extern "C" {
 
     //
     // State / sessions
+    //
+    // PrefixLM includes per-sequence prefix boundaries and next positions. Load the same model,
+    // KV configuration, fixed LoRA weights/scales and control vectors before restoring. Formats are distinct from
+    // causal/non-causal state. Sequence restore remaps its saved ID to dest_seq_id.
+    // A failed KV restore clears the destination (all sequences for a context restore); header
+    // validation failures preserve it. Boundary logits are restored via llama_get_logits_seq;
+    // sampler state is separate (llama_sampler_state_*).
+    // PrefixLM currently supports complete host snapshots only (sequence flags = 0).
     //
 
     // Returns the *actual* size in bytes of the state
@@ -978,6 +998,8 @@ extern "C" {
     // Process a batch of tokens.
     // Requires the context to have a memory.
     // For encode-decoder contexts, processes the batch using the decoder.
+    // PrefixLM: invalid input preserves memory; execution failure/abort clears the sequences in the call.
+    // The following partial-ubatch recovery rules apply to other attention modes.
     // Positive return values does not mean a fatal error, but rather a warning.
     // Upon fatal-error or abort, the ubatches that managed to be been processed will remain in the memory state of the context
     //   To handle this correctly, query the memory state using llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
@@ -990,6 +1012,25 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Return the selected attention mode (never UNSPECIFIED).
+    LLAMA_API enum llama_attention_type llama_get_attention_type(const struct llama_context * ctx);
+
+    // Start PrefixLM requests with complete bidirectional prefixes. Shared token owners require unified KV and identical dependencies.
+    // Each sequence starts at position 0; the entire batch must fit one physical batch.
+    // Replaces only the supplied sequences. Other live sequences retain their memory.
+    // Continue with llama_decode(): contiguous causal answers, optionally batched across sequences.
+    // Missing positions are inferred per sequence. Use llama_decode_prefix_mixed to combine phases.
+    // Invalid input returns -1 without mutation. Failure/abort clears all sequences in the call.
+    // PrefixLM supports answer-suffix removal, dependency-safe range copies and state restore; no prefix edits or shifting.
+    // Calls synchronize before returning; serialize operations on a context. Other modes are unchanged.
+    LLAMA_API int32_t llama_decode_prefix(struct llama_context * ctx, struct llama_batch batch);
+
+    // Mixed PrefixLM batch: listed sequences start anew, positions [0, prefix_end) are bidirectional;
+    // subsequent positions and unlisted live sequences are causal. Each complete new prefix must
+    // be included; a batch containing any new prefix must fit n_ubatch. No duplicate listed IDs.
+    LLAMA_API int32_t llama_decode_prefix_mixed(struct llama_context * ctx, struct llama_batch batch,
+            const llama_seq_id * seq_ids, const llama_pos * prefix_ends, size_t n_prefixes);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
@@ -1008,6 +1049,7 @@ extern "C" {
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
+    // Not allowed for PREFIX_LM contexts; use llama_decode_prefix() and llama_decode().
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
     // Set whether the model is in warmup mode or not
@@ -1033,6 +1075,11 @@ extern "C" {
     // Cols: n_vocab
     // TODO: deprecate in favor of llama_get_logits_ith() (ref: https://github.com/ggml-org/llama.cpp/pull/14853#issuecomment-3113143522)
     LLAMA_API float * llama_get_logits(struct llama_context * ctx);
+
+    // Last requested PrefixLM boundary logits for a sequence, also available after restore/fork.
+    // NULL when unavailable (including after suffix trimming), or outside PrefixLM mode.
+    // Borrowed until the next mutation of that sequence; n_vocab elements.
+    LLAMA_API const float * llama_get_logits_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab

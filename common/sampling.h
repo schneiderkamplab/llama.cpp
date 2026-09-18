@@ -123,3 +123,8 @@ struct common_sampler_deleter {
 };
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
+
+bool common_sampler_uses_backend(const common_sampler * sampler);
+
+// Sample a restored boundary row using an unattached host sampler.
+llama_token common_sampler_sample_logits(common_sampler * sampler, const float * logits, int32_t n_vocab, bool grammar_first = false);

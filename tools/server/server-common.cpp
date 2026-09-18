@@ -1522,14 +1522,16 @@ json format_response_rerank(
 //
 
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
-    std::vector<llama_token_data> cur;
-
     const auto * logits = llama_get_logits_ith(ctx, idx);
     const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
 
     const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
 
-    cur.resize(n_logits);
+    return get_token_probabilities(logits, sampled_ids, n_logits, n_top);
+}
+
+std::vector<llama_token_data> get_token_probabilities(const float * logits, const llama_token * sampled_ids, int n_logits, size_t n_top) {
+    std::vector<llama_token_data> cur(n_logits);
     if (sampled_ids) {
         for (int i = 0; i < n_logits; i++) {
             cur[i] = llama_token_data{sampled_ids[i], logits[i], 0.0f};

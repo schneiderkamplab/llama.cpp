@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <set>
 #include <memory>
 #include <functional>
 
@@ -81,6 +82,42 @@ struct llama_memory_i {
     using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
+
+    // PrefixLM request state. Public memory mutations must preserve these invariants.
+    bool prefix_lm = false;
+    struct prefix_state {
+        llama_pos end = 0;
+        llama_pos next = 0;
+        std::shared_ptr<const std::vector<float>> logits;
+    };
+    using prefix_states = std::map<llama_seq_id, prefix_state>;
+    prefix_states prefix_sequences;
+    uint32_t prefix_seq_limit = 0;
+    uint32_t prefix_max_sequences = 0;
+    uint32_t prefix_capacity = 0;
+    bool prefix_unified = false;
+    bool prefix_valid(const prefix_states & states) const {
+        if (states.size() > prefix_max_sequences) { return false; }
+        for (const auto & entry : states) {
+            const auto & state = entry.second;
+            if (entry.first < 0 || uint32_t(entry.first) >= prefix_seq_limit ||
+                state.end <= 0 || state.next < state.end || uint32_t(state.next) > prefix_capacity) { return false; }
+        }
+        return true;
+    }
+    bool prefix_batch = false;
+    virtual int64_t prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced = {},
+                                llama_seq_id copy_dst = -1) const {
+        int64_t used = 0;
+        for (const auto & entry : states) { used += entry.second.next; }
+        (void) replaced; (void) copy_dst;
+        return used;
+    }
+    virtual bool prefix_same(llama_seq_id a, llama_seq_id b, llama_pos end) const {
+        (void) end;
+        return a == b;
+    }
+    void prefix_reset() { prefix_sequences.clear(); }
 
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them

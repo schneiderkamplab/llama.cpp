@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <set>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -448,6 +449,61 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+int64_t llama_kv_cache::prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced,
+                                   llama_seq_id copy_dst) const {
+    // Answer-only appends normally need no cell scan. Use actual KV positions so this
+    // also remains correct when validating a just-restored full-context snapshot.
+    if (replaced.empty() && copy_dst < 0 && states.size() == prefix_sequences.size()) {
+        int64_t used = 0;
+        for (const auto & cells : v_cells) { used += cells.get_used(); }
+        bool append_only = true;
+        for (const auto & entry : states) {
+            const auto next = seq_pos_max(entry.first) + 1;
+            if (!prefix_sequences.count(entry.first) || entry.second.next < next) {
+                append_only = false;
+                break;
+            }
+            used += entry.second.next - next;
+        }
+        if (append_only) { return used; }
+    }
+    std::map<llama_seq_id, int64_t> retained;
+    int64_t used = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) { continue; }
+            bool keep = false;
+            for (const auto & entry : states) {
+                if (entry.first == copy_dst || replaced.count(entry.first)) { continue; }
+                if (cells.seq_has(i, entry.first) && cells.pos_get(i) < entry.second.next) {
+                    ++retained[entry.first];
+                    keep = true;
+                }
+            }
+            used += keep;
+        }
+    }
+    for (const auto & entry : states) {
+        if (entry.first != copy_dst) { used += entry.second.next - retained[entry.first]; }
+    }
+    return used;
+}
+
+bool llama_kv_cache::prefix_same(llama_seq_id a, llama_seq_id b, llama_pos end) const {
+    if (a == b || end == 0) { return true; }
+    if (seq_to_stream[a] != seq_to_stream[b]) { return false; }
+    const auto & cells = v_cells[seq_to_stream[a]];
+    llama_pos count = 0;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || cells.pos_get(i) >= end) { continue; }
+        const bool has_a = cells.seq_has(i, a);
+        const bool has_b = cells.seq_has(i, b);
+        if (has_a != has_b) { return false; }
+        count += has_a;
+    }
+    return count == end;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -710,7 +766,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0, prefix_batch);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -1539,6 +1595,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 struct args_set_input_kq_mask {
     const llama_hparams & hparams;
     const llama_ubatch  * ubatch;
+    const llama_memory_i::prefix_states * prefixes;
 
     const std::vector<llama_kv_cells> & v_cells;
     const std::vector<uint32_t>       & seq_to_stream;
@@ -1663,7 +1720,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 if (causal) {
                     // mask future tokens
-                    if (p0 > p1) {
+                    if (p0 > p1 && !(args.prefixes && args.prefixes->count(seq_id) &&
+                        p0 < args.prefixes->at(seq_id).end && p1 < args.prefixes->at(seq_id).end)) {
                         goto skip;
                     }
 
@@ -1765,6 +1823,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
+        /*.prefixes         =*/ prefix_lm ? &prefix_sequences : nullptr,
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
         /*.n_swa            =*/ n_swa,
@@ -2207,7 +2266,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
         for (uint32_t i = range.first; i < range.second; ++i) {
             std::vector<llama_seq_id> seq_ids;
 
-            for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+            for (llama_seq_id cur = 0; cur < (int) seq_to_stream.size(); ++cur) {
                 if (cur == seq_id || seq_id == -1) {
                     if (cells.seq_has(i, cur)) {
                         seq_ids.push_back(cur);
@@ -2335,6 +2394,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
+    if (cell_count > cells.size()) { return false; }
+    std::map<llama_seq_id, std::set<llama_pos>> prefix_positions;
+    auto prefix_position = [&](llama_seq_id id, llama_pos pos) {
+        return !prefix_lm || (pos >= 0 && uint32_t(pos) < prefix_capacity &&
+                prefix_positions[id].insert(pos).second);
+    };
 
     if (dest_seq_id != -1) {
         // single sequence
@@ -2385,6 +2450,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 io.read(&seq_id, sizeof(seq_id));
             }
 
+            if (!prefix_position(dest_seq_id, pos)) { return false; }
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
             ubatch.seq_id[i]   = &dest_seq_id;
@@ -2468,6 +2534,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
 
+            if (prefix_lm && (pos < 0 || uint32_t(pos) >= prefix_capacity ||
+                             n_seq_id == 0 || n_seq_id > n_seq_max)) { return false; }
             cells.pos_set(i, pos);
 
             if (has_cell_ext()) {
@@ -2480,11 +2548,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 llama_seq_id seq_id;
                 io.read(&seq_id, sizeof(seq_id));
 
-                if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
-                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
+                if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %zu)\n", __func__, seq_id, seq_to_stream.size());
                     return false;
                 }
 
+                if (prefix_lm && seq_to_stream[seq_id] != strm) { return false; }
+                if (!prefix_position(seq_id, pos)) { return false; }
                 cells.seq_add(i, seq_id);
             }
         }
@@ -2502,6 +2572,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         head = 0;
     }
 
+    for (const auto & entry : prefix_positions) {
+        const auto & positions = entry.second;
+        if (*positions.begin() != 0 || size_t(*positions.rbegin()) + 1 != positions.size()) { return false; }
+    }
     return true;
 }
 

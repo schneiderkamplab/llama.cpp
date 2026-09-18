@@ -194,6 +194,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
+    foreach(PREFIX_ARCH hrm_text llama)
+        llama_test(test-llama-archs NAME test-prefix-lm-${PREFIX_ARCH} LABEL main
+            ARGS --prefix-lm --arch ${PREFIX_ARCH} --seed 42)
+    endforeach()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 

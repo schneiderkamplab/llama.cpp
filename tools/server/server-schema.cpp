@@ -539,6 +539,13 @@ task_params eval_llama_cmpl_schema(
     params.chat_parser_params.reasoning_format = params_base.reasoning_format;
 
     // create context and schema
+    if (params_base.attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        for (auto it = data.begin(); it != data.end(); ++it) {
+            if (it.key() == "speculative" || it.key().find("speculative.") == 0) {
+                throw std::invalid_argument("PrefixLM does not support speculative request options");
+            }
+        }
+    }
     field_eval_context ctx(params);
     ctx.vocab          = vocab;
     ctx.logit_bias_eog = &logit_bias_eog;

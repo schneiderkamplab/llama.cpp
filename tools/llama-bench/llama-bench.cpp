@@ -1459,6 +1459,7 @@ struct test {
     const std::string        gpu_info;
     std::string              model_filename;
     std::string              model_type;
+    std::string              attention;
     uint64_t                 model_size;
     uint64_t                 model_n_params;
     int                      n_batch;
@@ -1499,6 +1500,9 @@ struct test {
         char buf[128];
         llama_model_desc(lmodel, buf, sizeof(buf));
         model_type     = buf;
+        const auto mode = llama_get_attention_type(ctx);
+        attention = mode == LLAMA_ATTENTION_TYPE_PREFIX_LM ? "prefix-lm" :
+                    mode == LLAMA_ATTENTION_TYPE_CAUSAL ? "causal" : "non-causal";
         model_size     = llama_model_size(lmodel);
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
@@ -1577,7 +1581,7 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
-            "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+            "model_filename", "model_type", "attention", "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
@@ -1657,6 +1661,7 @@ struct test {
                                             get_backend(),
                                             model_filename,
                                             model_type,
+                                            attention,
                                             std::to_string(model_size),
                                             std::to_string(model_n_params),
                                             std::to_string(n_batch),
@@ -2141,6 +2146,14 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
+    const bool prefix = llama_get_attention_type(ctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM;
+    if (prefix) {
+        if (n_prompt > (int) llama_n_batch(ctx) || n_prompt > (int) llama_n_ubatch(ctx)) {
+            fprintf(stderr, "%s: PrefixLM needs the complete prompt within -b and -ub\n", __func__);
+            return false;
+        }
+        n_batch = n_prompt;
+    }
     std::vector<llama_token> tokens(n_batch);
 
     int n_processed = 0;
@@ -2151,7 +2164,8 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        auto batch = llama_batch_get_one(tokens.data(), n_tokens);
+        int res = prefix ? llama_decode_prefix(ctx, batch) : llama_decode(ctx, batch);
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
@@ -2335,6 +2349,15 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        const bool prefix = llama_model_is_prefix_lm(lmodel);
+        if (prefix && inst.n_depth > 0) {
+            fprintf(stderr, "%s: PrefixLM does not support cached depth benchmarks\n", __func__);
+            llama_model_free(lmodel);
+            return 1;
+        }
+        // Generation-only measurements need an untimed seed prefix.
+        if (prefix && inst.n_prompt == 0) { ++cparams.n_ctx; }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2372,8 +2395,16 @@ int llama_bench(int argc, char ** argv) {
 
         llama_attach_threadpool(ctx, threadpool, NULL);
 
+        auto seed_prefix = [&]() {
+            if (prefix && t.n_prompt == 0 && !test_prompt(ctx, 1, t.n_batch, t.n_threads)) {
+                fprintf(stderr, "%s: failed to initialize PrefixLM generation benchmark\n", __func__);
+                exit(1);
+            }
+        };
+
         // warmup run
         if (!params.no_warmup) {
+            seed_prefix();
             if (t.n_prompt > 0) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
@@ -2441,6 +2472,7 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            seed_prefix();
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {

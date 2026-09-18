@@ -295,6 +295,8 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    llama_tokens exact_prefix_tokens;
+    std::vector<uint8_t> exact_prefix_state;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -441,6 +443,9 @@ struct server_slot {
     bool can_split() const {
         GGML_ASSERT(task);
 
+        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            return false;
+        }
         return
             !task->need_embd() ||
             (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
@@ -551,8 +556,8 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // Retained generations own their KV until resumed, replaced, or explicitly erased.
+            if (task->is_child() || (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM)) {
                 prompt_clear();
             }
 
@@ -1109,6 +1114,22 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        params_base.attention_type = llama_get_attention_type(ctx_tgt);
+        if (params_base.attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            const bool speculative = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+            if (has_mmproj || has_draft || speculative || params_base.n_cache_reuse != 0) {
+                SRV_ERR("%s", "PrefixLM does not support multimodal input, speculation, cache shifting\n");
+                return false;
+            }
+            params_base.cache_prompt = false;
+            params_base.cache_idle_slots = false;
+            params_base.cache_ram_mib = 0;
+            params_base.n_ctx_checkpoints = 0;
+            params_base.ctx_shift = false;
+            SRV_INF("%s", "PrefixLM: complete-prefix requests; cache reuse, checkpoints and context shifting disabled\n");
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1705,6 +1726,21 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            const bool speculative = std::any_of(task.params.speculative.types.begin(), task.params.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+            if (task.type != SERVER_TASK_TYPE_COMPLETION || task.params.n_cache_reuse != 0 ||
+                speculative || !task.params.lora.empty() || task.tokens.has_mtmd) {
+                send_error(task, "PrefixLM requires text completion without partial cache reuse, speculation, or per-request adapters", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            if (task.n_tokens() > int(llama_n_ubatch(ctx_tgt)) || task.n_tokens() > int(llama_n_batch(ctx_tgt)) ||
+                task.n_tokens() >= slot.n_ctx) {
+                send_error(task.id, "PrefixLM requires the complete prefix within batch and context capacity",
+                           ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot.n_ctx);
+                return false;
+            }
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1780,7 +1816,8 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                common_sampler_ptr sampler(common_sampler_init(model_tgt, task.params.sampling));
+                slot.smpl = std::move(sampler);
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -1789,10 +1826,12 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = common_sampler_uses_backend(slot.smpl.get());
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+            // Exact prefix cache stores raw boundary logits; use the same host sampling path on misses and hits.
+            use_backend_sampling &= !(task.params.cache_prompt && llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM);
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
@@ -1817,12 +1856,14 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            slot.prompt_clear();
+        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
-
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -1961,7 +2002,7 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx, const float * boundary = nullptr) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -1993,7 +2034,9 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = boundary
+                ? get_token_probabilities(boundary, nullptr, llama_vocab_n_tokens(vocab), n_probs_request)
+                : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2104,7 +2147,7 @@ private:
             res->content     = "";
             res->tokens      = llama_tokens{};
         } else {
-            res->content     = std::move(slot.generated_text);
+            res->content     = slot.generated_text;
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
@@ -2379,6 +2422,11 @@ private:
             return false;
         }
 
+        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+            task.type == SERVER_TASK_TYPE_SET_LORA) {
+            send_error(task, "PrefixLM does not support dynamic adapter changes", ERROR_TYPE_INVALID_REQUEST);
+            return true;
+        }
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -2544,6 +2592,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+                        send_error(task, "PrefixLM slot files require the optional generation-persistence patch", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2594,6 +2646,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+                        send_error(task, "PrefixLM slot files require the optional generation-persistence patch", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2676,6 +2732,9 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    slot->exact_prefix_tokens.clear();
+                    slot->exact_prefix_state.clear();
+                    queue_tasks.pop_deferred_task(slot->id);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -2980,9 +3039,23 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
-        // determine which slots are generating and drafting
+        const bool prefix_pending = llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+            std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+            });
+        int prefix_reserve = 0;
+        if (prefix_pending) {
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    prefix_reserve = slot.task->n_tokens();
+                    break;
+                }
+            }
+        }
+        // Leave room for a complete pending prefix while batching causal answers with it.
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING) {
+            if (slot.state != SLOT_STATE_GENERATING || (prefix_pending &&
+                generating.size() >= size_t(std::max(0, int(llama_n_ubatch(ctx_tgt)) - prefix_reserve)))) {
                 return;
             }
 
@@ -3103,6 +3176,7 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        if (prefix_pending) { n_batch = std::min(n_batch, n_ubatch); }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3117,6 +3191,10 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                if (slot.state == SLOT_STATE_GENERATING) {
                     return;
                 }
 
@@ -3143,6 +3221,25 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+                            slot.task->params.cache_prompt && !slot.task->is_parent() && !slot.task->is_child() &&
+                            input_tokens.get_text_tokens() == slot.exact_prefix_tokens && !slot.exact_prefix_state.empty()) {
+                            const auto & saved = slot.exact_prefix_state;
+                            if (llama_state_seq_set_data(ctx_tgt, saved.data(), saved.size(), slot.id) == saved.size() &&
+                                llama_get_logits_seq(ctx_tgt, slot.id)) {
+                                slot.prompt.tokens.insert(input_tokens.get_text_tokens());
+                                for (auto token : slot.exact_prefix_tokens) { common_sampler_accept(slot.smpl.get(), token, false); }
+                                slot.stats.n_prompt_cached = input_tokens.size();
+                                slot.state = SLOT_STATE_DONE_PROMPT;
+                                llama_batch empty = {};
+                                post_decode(0, 0, empty, &slot);
+                                return;
+                            }
+                            slot.prompt_clear();
+                            slot.exact_prefix_state.clear();
+                            slot.exact_prefix_tokens.clear();
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3679,12 +3776,38 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            if (llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+                std::map<llama_seq_id, llama_pos> prefixes;
+                for (int i = 0; i < batch_view.n_tokens; ++i) {
+                    const auto & token = batch.tokens[off + i];
+                    if (token.is_prompt) { prefixes[token.id_slot] = token.pos + 1; }
+                }
+                std::vector<llama_seq_id> ids;
+                std::vector<llama_pos> ends;
+                for (const auto & entry : prefixes) { ids.push_back(entry.first); ends.push_back(entry.second); }
+                ret = llama_decode_prefix_mixed(ctx_tgt, batch_view, ids.data(), ends.data(), ids.size());
+            } else {
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
 
+        if (ret != 0 && llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            for (auto & slot : slots) {
+                bool affected = false;
+                for (int i = 0; i < batch_view.n_tokens; ++i) {
+                    affected |= batch_view.seq_id[i][0] == slot.id;
+                }
+                if (affected && slot.is_processing()) {
+                    send_error(slot, "PrefixLM execution failed; sequence cleared without split retry.");
+                    slot.release();
+                    slot.i_batch = -1;
+                }
+            }
+            return true;
+        }
         if (ret != 0) {
             {
                 std::string err;
@@ -3781,7 +3904,7 @@ private:
         return true;
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view, server_slot * cached_slot = nullptr) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -3810,7 +3933,7 @@ private:
                 }
             }
 
-            if (!is_inside_view(slot.i_batch)) {
+            if (cached_slot ? cached_slot != &slot : !is_inside_view(slot.i_batch)) {
                 // the required token not in this sub-batch, skip
                 return;
             }
@@ -3833,6 +3956,18 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
+                if (!cached_slot && slot.task->params.cache_prompt &&
+                    llama_get_attention_type(ctx_tgt) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+                    const auto size = llama_state_seq_get_size(ctx_tgt, slot.id);
+                    slot.exact_prefix_state.resize(size);
+                    if (size && llama_state_seq_get_data(ctx_tgt, slot.exact_prefix_state.data(), size, slot.id) == size) {
+                        slot.exact_prefix_tokens = slot.task->tokens.get_text_tokens();
+                    } else {
+                        slot.exact_prefix_state.clear();
+                        slot.exact_prefix_tokens.clear();
+                    }
+                }
+
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
@@ -3853,7 +3988,9 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                id = cached_slot
+                    ? common_sampler_sample_logits(slot.smpl.get(), llama_get_logits_seq(ctx_tgt, slot.id), llama_vocab_n_tokens(vocab))
+                    : common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
             slot.i_batch = -1;
@@ -3879,7 +4016,7 @@ private:
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
             if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx, cached_slot ? llama_get_logits_seq(ctx_tgt, slot.id) : nullptr);
             }
 
             if (!process_token(result, slot)) {

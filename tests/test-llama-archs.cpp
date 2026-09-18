@@ -1,14 +1,23 @@
 #include "common.h"
+#include "sampling.h"
 #include "log.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "nlohmann/json.hpp"
+
+#include <fstream>
+#include <cmath>
+#include <algorithm>
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-adapter.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -65,7 +74,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--prefix-lm] [--prefix-reference FILE] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -825,6 +834,679 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+static int test_prefix_reference(const std::string & path) {
+    using json = nlohmann::ordered_json;
+    std::ifstream input(path);
+    const auto spec = json::parse(input);
+    auto mp = llama_model_default_params();
+    mp.n_gpu_layers = spec.value("n_gpu_layers", 0);
+    llama_model_ptr model(llama_model_load_from_file(spec.at("model").get<std::string>().c_str(), mp));
+    if (!model) { throw std::runtime_error("reference model load failed"); }
+    const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    json results = json::array();
+    bool passed = true;
+    for (const auto & item : spec.at("cases")) {
+        auto cp = llama_context_default_params();
+        cp.n_ctx = spec.value("n_ctx", 128);
+        cp.n_seq_max = item.value("n_seq_max", 1);
+        cp.kv_unified = item.value("kv_unified", false);
+        cp.n_batch = cp.n_ctx;
+        cp.n_ubatch = spec.value("n_ubatch", 64);
+        cp.n_threads = cp.n_threads_batch = 4;
+        cp.type_k = cp.type_v = GGML_TYPE_F32;
+        cp.flash_attn_type = spec.value("flash", false) ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cp.attention_type = item.value("causal", false) ? LLAMA_ATTENTION_TYPE_CAUSAL : LLAMA_ATTENTION_TYPE_PREFIX_LM;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        if (!ctx) { throw std::runtime_error("reference context init failed"); }
+        std::map<llama_seq_id, llama_pos> positions;
+        for (const auto & step : item.at("steps")) {
+            const auto owners = step.value("owners", std::vector<llama_seq_id>{step.value("sequence", 0)});
+            const auto seq = owners.at(0);
+            auto & pos = positions[seq];
+            if (step.at("prefix").get<bool>()) { pos = 0; }
+            if (step.contains("rewind_to")) {
+                const auto target = step.at("rewind_to").get<llama_pos>();
+                if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, target, -1)) {
+                    throw std::runtime_error("reference answer rollback failed");
+                }
+                pos = target;
+            }
+            const auto tokens = step.at("tokens").get<std::vector<llama_token>>();
+            const bool all = step.value("all_logits", true);
+            auto batch = llama_batch_init(tokens.size(), 0, owners.size());
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                common_batch_add(batch, tokens[i], pos + i, owners, all || i + 1 == tokens.size());
+            }
+            const llama_seq_id sequence = seq;
+            const llama_pos prefix_end = step.value("prefix_end", 0);
+            const int ret = prefix_end > 0
+                ? llama_decode_prefix_mixed(ctx.get(), batch, &sequence, &prefix_end, 1)
+                : step.at("prefix").get<bool>() ? llama_decode_prefix(ctx.get(), batch) : llama_decode(ctx.get(), batch);
+            llama_batch_free(batch);
+            if (ret != 0) { throw std::runtime_error("reference decode failed"); }
+            const size_t rows = all ? tokens.size() : 1;
+            std::vector<float> expected(rows * nv);
+            std::ifstream ref(step.at("reference").get<std::string>(), std::ios::binary);
+            ref.read(reinterpret_cast<char *>(expected.data()), expected.size() * sizeof(float));
+            if (!ref || ref.peek() != EOF) { throw std::runtime_error("invalid reference logit size"); }
+            std::ofstream dump;
+            if (spec.contains("logits_dir")) {
+                dump.open(spec.at("logits_dir").get<std::string>() + "/" + item.at("name").get<std::string>() + "-" + std::to_string(pos) + ".f32", std::ios::binary);
+                if (!dump) { throw std::runtime_error("cannot write logits"); }
+            }
+            double max_abs = 0, squared = 0;
+            int same_top = 0;
+            bool finite = true;
+            for (size_t i = 0; i < rows; ++i) {
+                const float * got = llama_get_logits_ith(ctx.get(), all ? i : tokens.size() - 1);
+                if (dump.is_open()) { dump.write(reinterpret_cast<const char *>(got), nv * sizeof(float)); }
+                const float * want = expected.data() + i * nv;
+                same_top += std::max_element(got, got + nv) - got == std::max_element(want, want + nv) - want;
+                for (int j = 0; j < nv; ++j) {
+                    finite &= std::isfinite(got[j]) && std::isfinite(want[j]);
+                    const double delta = double(got[j]) - want[j];
+                    max_abs = std::max(max_abs, std::abs(delta));
+                    squared += delta * delta;
+                }
+            }
+            if (dump.is_open() && !dump) { throw std::runtime_error("logit write failed"); }
+            const bool ok = finite && max_abs <= spec.value("max_abs", 0.0001);
+            passed &= ok;
+            results.push_back({{"case", item.at("name")}, {"sequence", seq}, {"position", pos}, {"rows", rows},
+                               {"finite", finite}, {"max_abs", max_abs}, {"rmse", std::sqrt(squared / expected.size())},
+                               {"top1_matches", same_top}, {"pass", ok}});
+            pos += tokens.size();
+            for (auto owner : owners) { positions[owner] = pos; }
+        }
+    }
+    json report = {{"pass", passed}, {"specification", spec}, {"steps", results}};
+    std::ofstream output(spec.at("report").get<std::string>());
+    output << report.dump(2) << '\n';
+    if (!output) { throw std::runtime_error("cannot write reference result"); }
+    printf("independent reference: %zu steps, pass=%d\n", results.size(), passed);
+    return passed ? 0 : 1;
+}
+
+static int test_prefix_lm(const llm_arch arch, size_t seed) {
+    if (arch != LLM_ARCH_HRM_TEXT && arch != LLM_ARCH_LLAMA) {
+        throw std::runtime_error("--prefix-lm requires --arch hrm_text or llama");
+    }
+    int checks = 0;
+    auto require = [&](bool ok, const char * message) {
+        if (!ok) { throw std::runtime_error(message); }
+        ++checks;
+    };
+    std::vector<std::vector<ggml_backend_dev_t>> devices = {{}};
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * device = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) { devices.push_back({device}); }
+    }
+    for (const auto & devs : devices) {
+        auto gguf = get_gguf_ctx(arch, false);
+        if (arch == LLM_ARCH_HRM_TEXT) {
+            llama_model_saver(arch, gguf.get()).add_kv(LLM_KV_HRM_PREFIX_LM, true);
+        }
+        auto owner = get_model_and_ctx(gguf.get(), nullptr, seed, devs);
+        auto * model = owner.first.get();
+        require(llama_get_attention_type(owner.second.get()) ==
+                (arch == LLM_ARCH_HRM_TEXT ? LLAMA_ATTENTION_TYPE_PREFIX_LM : LLAMA_ATTENTION_TYPE_CAUSAL), "model default attention");
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        {
+            auto cp = llama_context_default_params();
+            cp.attention_type = LLAMA_ATTENTION_TYPE_PREFIX_LM;
+            cp.kv_unified = true; cp.n_seq_max = 2; cp.n_ctx = cp.n_batch = cp.n_ubatch = 16;
+            llama_context_ptr shared(llama_init_from_model(model, cp));
+            require(bool(shared), "shared capacity context");
+            auto * memory = llama_get_memory(shared.get());
+            auto tokens = get_tokens(12, n_vocab, seed);
+            require(llama_decode_prefix(shared.get(), llama_batch_get_one(tokens.data(), tokens.size())) == 0, "shared capacity prefix");
+            llama_memory_seq_cp(memory, 0, 7, 0, -1);
+            require(llama_memory_seq_pos_max(memory, 7) == 11, "fork counts physical cells once");
+            auto batch = llama_batch_init(4, 0, 1);
+            for (int i = 0; i < 2; ++i) {
+                common_batch_add(batch, tokens[i], 12 + i, {0}, true);
+                common_batch_add(batch, tokens[i + 2], 12 + i, {7}, true);
+            }
+            require(llama_decode(shared.get(), batch) == 0, "divergent answers fill remaining physical capacity");
+            common_batch_clear(batch);
+            common_batch_add(batch, tokens[0], 14, {0}, true);
+            require(llama_decode(shared.get(), batch) == -1, "physical capacity enforced before padded capacity");
+            std::vector<uint8_t> state(llama_state_get_size(shared.get()));
+            require(llama_state_get_data(shared.get(), state.data(), state.size()) == state.size(), "save shared physical capacity");
+            llama_memory_clear(memory, false);
+            require(llama_state_set_data(shared.get(), state.data(), state.size()) == state.size(), "restore shared capacity without double counting");
+            auto replacement = get_tokens(5, n_vocab, seed + 1);
+            require(llama_decode_prefix(shared.get(), llama_batch_get_one(replacement.data(), replacement.size())) == -1,
+                    "replacement cannot reclaim sibling-owned shared cells");
+            llama_batch_free(batch);
+            llama_memory_clear(memory, false);
+            batch = llama_batch_init(12, 0, 2);
+            for (int i = 0; i < 12; ++i) { common_batch_add(batch, tokens[i], i, {0, 7}, true); }
+            require(llama_decode_prefix(shared.get(), batch) == 0, "shared input prefix counts physical rows once");
+            common_batch_clear(batch);
+            for (int i = 0; i < 4; ++i) { common_batch_add(batch, tokens[i], 12+i, {0, 7}, true); }
+            require(llama_decode(shared.get(), batch) == 0, "shared answers fill physical capacity once");
+            common_batch_clear(batch);
+            common_batch_add(batch, tokens[0], 16, {0, 7}, true);
+            require(llama_decode(shared.get(), batch) == -1, "shared input cannot exceed physical capacity");
+            llama_batch_free(batch);
+        }
+        for (bool flash : {false, true}) {
+            auto params = llama_context_default_params();
+            params.n_ctx = 128;
+            params.n_batch = 128;
+            params.n_ubatch = 64;
+            params.n_threads = params.n_threads_batch = 4;
+            params.type_k = params.type_v = GGML_TYPE_F32;
+            params.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            params.attention_type = LLAMA_ATTENTION_TYPE_PREFIX_LM;
+            llama_context_ptr ctx(llama_init_from_model(model, params));
+            require(bool(ctx), "create explicit PrefixLM context");
+            require(llama_get_attention_type(ctx.get()) == LLAMA_ATTENTION_TYPE_PREFIX_LM, "selected mode");
+            auto * mem = llama_get_memory(ctx.get());
+            auto input = get_tokens(8, n_vocab, seed);
+            auto answer = get_tokens(4, n_vocab, seed + 1);
+            auto run = [&](llama_context * target, const std::vector<llama_token> & tokens, int pos, bool prefix, llama_seq_id seq = 0) {
+                auto batch = llama_batch_init(tokens.size(), 0, 1);
+                for (size_t i = 0; i < tokens.size(); ++i) { common_batch_add(batch, tokens[i], pos + i, {seq}, true); }
+                const int code = prefix ? llama_decode_prefix(target, batch) : llama_decode(target, batch);
+                llama_batch_free(batch);
+                require(code == 0, "decode");
+                std::vector<float> result;
+                for (size_t i = 0; i < tokens.size(); ++i) {
+                    const auto * logits = llama_get_logits_ith(target, i);
+                    result.insert(result.end(), logits, logits + n_vocab);
+                }
+                return result;
+            };
+            auto equal = [&](const std::vector<float> & a, const std::vector<float> & b) {
+                require(nmse(a, b) < 1e-6, "logit parity");
+            };
+            require(llama_decode(ctx.get(), llama_batch_get_one(input.data(), input.size())) == -1, "answer without prefix rejected");
+            auto reference = run(ctx.get(), input, 0, true);
+            auto chunk = run(ctx.get(), answer, input.size(), false);
+            run(ctx.get(), input, 0, true);
+            std::vector<float> singles;
+            for (size_t i = 0; i < answer.size(); ++i) {
+                auto logits = run(ctx.get(), {answer[i]}, input.size() + i, false);
+                singles.insert(singles.end(), logits.begin(), logits.end());
+            }
+            equal(chunk, singles);
+            auto long_answer = get_tokens(65, n_vocab, seed + 2);
+            run(ctx.get(), input, 0, true);
+            auto split_internal = run(ctx.get(), long_answer, input.size(), false);
+            run(ctx.get(), input, 0, true);
+            auto split_explicit = run(ctx.get(), std::vector<llama_token>(long_answer.begin(), long_answer.begin() + 32), input.size(), false);
+            auto tail = run(ctx.get(), std::vector<llama_token>(long_answer.begin() + 32, long_answer.end()), input.size() + 32, false);
+            split_explicit.insert(split_explicit.end(), tail.begin(), tail.end());
+            equal(split_internal, split_explicit);
+            auto changed_answer = answer;
+            changed_answer.back() = (changed_answer.back() + 1) % n_vocab;
+            run(ctx.get(), input, 0, true);
+            auto changed = run(ctx.get(), changed_answer, input.size(), false);
+            equal(std::vector<float>(chunk.begin(), chunk.end() - n_vocab), std::vector<float>(changed.begin(), changed.end() - n_vocab));
+            auto changed_input = input;
+            changed_input.back() = (changed_input.back() + 1) % n_vocab;
+            auto future = run(ctx.get(), changed_input, 0, true);
+            const double visibility = nmse(std::vector<float>(reference.begin(), reference.begin() + n_vocab),
+                                           std::vector<float>(future.begin(), future.begin() + n_vocab));
+            printf("prefix visibility nmse = %.12g\n", visibility);
+            require(visibility > 0, "prefix future visibility");
+            equal(reference, run(ctx.get(), input, 0, true));
+            {
+                llama_adapter_lora adapter(model);
+                adapter.alpha = 2.0f;
+                const auto * output = model->get_tensor("output.weight");
+                require(output != nullptr, "output tensor for adapter fixture");
+                ggml_context_ptr adapter_ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+                auto * a = ggml_new_tensor_2d(adapter_ctx.get(), GGML_TYPE_F32, output->ne[0], 2);
+                auto * b = ggml_new_tensor_2d(adapter_ctx.get(), GGML_TYPE_F32, 2, output->ne[1]);
+                ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(adapter_ctx.get(), ggml_backend_cpu_buffer_type()));
+                std::vector<float> a_data(ggml_nelements(a)), b_data(ggml_nelements(b));
+                for (size_t i = 0; i < a_data.size(); ++i) { a_data[i] = 0.1f * std::sin(float(i)); }
+                for (size_t i = 0; i < b_data.size(); ++i) { b_data[i] = 0.1f * std::cos(float(i)); }
+                ggml_backend_tensor_set(a, a_data.data(), 0, ggml_nbytes(a));
+                ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
+                adapter.ab_map.emplace("output.weight", llama_adapter_lora_weight{a, b});
+                llama_adapter_lora * adapters[] = {&adapter};
+                float scale = 1.0f;
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) != 0, "adding adapter with live KV rejected");
+                llama_memory_clear(mem, false);
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) == 0, "fixed adapter installed");
+                const auto adapted = run(ctx.get(), input, 0, true);
+                require(nmse(adapted, reference) > 1e-8, "adapter changes model output");
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) == 0, "same adapter with live KV allowed");
+                require(llama_set_adapters_lora(ctx.get(), nullptr, 0, nullptr) != 0, "removing live adapter rejected");
+                std::vector<uint8_t> adapted_state(llama_state_get_size(ctx.get()));
+                require(llama_state_get_data(ctx.get(), adapted_state.data(), adapted_state.size()) == adapted_state.size(), "save adapted state");
+                const auto adapted_answer = run(ctx.get(), answer, input.size(), false);
+                require(llama_state_set_data(ctx.get(), adapted_state.data(), adapted_state.size()) == adapted_state.size(), "restore matching adapter");
+                equal(adapted_answer, run(ctx.get(), answer, input.size(), false));
+                llama_memory_clear(mem, false);
+                llama_adapter_lora reloaded(model);
+                reloaded.ab_map = adapter.ab_map;
+                reloaded.alpha = adapter.alpha;
+                llama_adapter_lora * reloaded_adapters[] = {&reloaded};
+                require(llama_set_adapters_lora(ctx.get(), reloaded_adapters, 1, &scale) == 0, "equivalent adapter object installed");
+                require(llama_state_set_data(ctx.get(), adapted_state.data(), adapted_state.size()) == adapted_state.size(), "adapter signature independent of pointer");
+                equal(adapted_answer, run(ctx.get(), answer, input.size(), false));
+                scale = 0.5f;
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) != 0, "live scale change rejected");
+                llama_memory_clear(mem, false);
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) == 0, "scale change after clear allowed");
+                require(llama_state_set_data(ctx.get(), adapted_state.data(), adapted_state.size()) == 0, "adapter mismatch rejected");
+                require(llama_set_adapters_lora(ctx.get(), nullptr, 0, nullptr) == 0, "adapter removed after clear");
+                adapter.alora_invocation_tokens = {input[0]};
+                require(llama_set_adapters_lora(ctx.get(), adapters, 1, &scale) != 0, "activated LoRA rejected");
+            }
+            equal(reference, run(ctx.get(), input, 0, true));
+            {
+                const int width = llama_model_n_embd(model);
+                const int layers = llama_model_n_layer(model);
+                std::vector<float> control(size_t(width) * (layers - 1));
+                for (size_t i = 0; i < control.size(); ++i) { control[i] = 0.01f * std::sin(float(i)); }
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), control.size(), width, 1, layers - 1) != 0,
+                        "live control vector change rejected");
+                llama_memory_clear(mem, false);
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), control.size(), width, 1, layers - 1) == 0,
+                        "fixed control vector installed");
+                const auto controlled = run(ctx.get(), input, 0, true);
+                require(nmse(controlled, reference) > 0, "control vector affects output");
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), control.size(), width, 1, layers - 1) == 0,
+                        "same live control vector accepted");
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), width, width, 1, layers - 1) == 0,
+                        "same live partial control vector update accepted");
+                require(llama_set_adapter_cvec(ctx.get(), nullptr, 0, width, 1, layers - 1) != 0,
+                        "live control vector removal rejected");
+                std::vector<uint8_t> state(llama_state_get_size(ctx.get()));
+                require(llama_state_get_data(ctx.get(), state.data(), state.size()) == state.size(), "save controlled state");
+                llama_memory_clear(mem, false);
+                require(llama_set_adapter_cvec(ctx.get(), nullptr, 0, width, 1, layers - 1) == 0, "remove cleared control vector");
+                require(llama_state_set_data(ctx.get(), state.data(), state.size()) == 0, "control vector mismatch rejected");
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), control.size(), width, 1, layers - 1) == 0, "reload control vector");
+                require(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size(), "restore controlled state");
+                const auto * saved = llama_get_logits_seq(ctx.get(), 0);
+                require(saved != nullptr, "saved boundary logits present");
+                equal(std::vector<float>(controlled.end() - n_vocab, controlled.end()), std::vector<float>(saved, saved + n_vocab));
+                llama_memory_clear(mem, false);
+                require(llama_set_adapter_cvec(ctx.get(), control.data(), 1, width, 1, layers - 1) != 0, "short control vector rejected");
+                require(llama_set_adapter_cvec(ctx.get(), nullptr, 0, width, 1, layers - 1) == 0, "disable control vector");
+            }
+            equal(reference, run(ctx.get(), input, 0, true));
+            const auto pos = llama_memory_seq_pos_max(mem, 0);
+            auto oversized = get_tokens(65, n_vocab, seed);
+            require(llama_decode_prefix(ctx.get(), llama_batch_get_one(oversized.data(), oversized.size())) == -1, "no split prefix");
+            require(llama_memory_seq_pos_max(mem, 0) == pos, "invalid prefix preserves memory");
+            llama_token bad = n_vocab;
+            require(llama_decode_prefix(ctx.get(), llama_batch_get_one(&bad, 1)) == -1, "invalid token rejected");
+            auto batch = llama_batch_init(1, 0, 1);
+            common_batch_add(batch, input[0], 0, {1}, true);
+            require(llama_decode_prefix(ctx.get(), batch) == -1, "foreign sequence rejected");
+            batch.seq_id[0][0] = 0;
+            require(llama_decode(ctx.get(), batch) == -1, "rewriting prefix rejected");
+            llama_batch_free(batch);
+            require(!llama_memory_seq_rm(mem, 0, 1, -1), "partial removal rejected");
+            require(!llama_memory_can_shift(mem), "shift capability disabled");
+            llama_memory_seq_add(mem, 0, 0, -1, 1);
+            llama_memory_seq_div(mem, 0, 0, -1, 2);
+            llama_memory_seq_cp(mem, 0, 1, 0, -1);
+            require(llama_memory_seq_pos_max(mem, 0) == pos && llama_memory_seq_pos_max(mem, 1) == -1, "unsafe memory operations preserve state");
+            require(llama_state_get_size(ctx.get()) > 0, "state saving supported");
+            require(llama_state_seq_get_size(ctx.get(), 0) > 0, "sequence saving supported");
+            require(llama_state_set_data(ctx.get(), nullptr, 0) == 0, "state loading rejected before reading input");
+            require(llama_state_seq_set_data(ctx.get(), nullptr, 0, 0) == 0, "sequence loading rejected");
+            llama_set_causal_attn(ctx.get(), false);
+            require(llama_get_attention_type(ctx.get()) == LLAMA_ATTENTION_TYPE_PREFIX_LM, "raw phase override rejected");
+            equal(chunk, run(ctx.get(), answer, input.size(), false));
+            const int next = input.size() + answer.size();
+            require(llama_memory_seq_rm(mem, 0, 2, 2), "empty prefix interval is a no-op");
+            require(llama_memory_seq_rm(mem, -1, 3, 1), "reversed interval is a no-op");
+            require(llama_memory_seq_rm(mem, 0, next, -1), "removal after answer is a no-op");
+            require(!llama_memory_seq_rm(mem, 0, input.size(), next - 1), "answer hole rejected");
+            require(!llama_memory_seq_rm(mem, -1, 0, input.size()), "prefix-only removal rejected");
+            llama_memory_seq_keep(mem, 0);
+            llama_memory_seq_cp(mem, 0, 0, 1, 3);
+            require(llama_memory_seq_pos_max(mem, 0) == next - 1, "safe memory operations preserve positions");
+            for (const auto range : std::vector<std::pair<int, int>>{{0, -1}, {-1, next}, {0, next + 10}}) {
+                const int trim = input.size() + 1;
+                require(llama_memory_seq_rm(mem, range.first, trim, range.second), "answer suffix removed");
+                require(llama_memory_seq_pos_max(mem, 0) == trim - 1, "suffix positions updated");
+                equal(std::vector<float>(chunk.begin() + n_vocab, chunk.end()),
+                      run(ctx.get(), std::vector<llama_token>(answer.begin() + 1, answer.end()), trim, false));
+            }
+            require(llama_memory_seq_rm(mem, -1, input.size(), -1), "all answer tokens removed");
+            equal(chunk, run(ctx.get(), answer, input.size(), false));
+            require(llama_memory_seq_rm(mem, 0, -1, next), "finite full removal");
+            require(llama_memory_seq_pos_max(mem, 0) == -1, "full removal clears KV");
+            require(llama_decode(ctx.get(), llama_batch_get_one(answer.data(), 1)) == -1, "full removal invalidates phase");
+            require(llama_memory_seq_rm(mem, 0, 1, 2), "empty request removal is a no-op");
+            equal(reference, run(ctx.get(), input, 0, true));
+            llama_memory_clear(mem, true);
+            require(llama_decode(ctx.get(), llama_batch_get_one(answer.data(), answer.size())) == -1, "clear invalidates prefix state");
+            run(ctx.get(), {input[0]}, 0, true);
+            run(ctx.get(), {answer[0]}, 1, false);
+            auto full = get_tokens(64, n_vocab, seed);
+            run(ctx.get(), full, 0, true);
+            run(ctx.get(), full, 64, false);
+            require(llama_decode(ctx.get(), llama_batch_get_one(answer.data(), 1)) == -1, "context overflow rejected");
+            bool abort = true;
+            llama_set_abort_callback(ctx.get(), [](void * data) { return *static_cast<bool *>(data); }, &abort);
+            require(llama_decode_prefix(ctx.get(), llama_batch_get_one(input.data(), input.size())) == 2, "abort returned");
+            require(llama_memory_seq_pos_max(mem, 0) == -1, "abort clears all KV");
+            require(llama_decode(ctx.get(), llama_batch_get_one(answer.data(), 1)) == -1, "aborted prefix cannot continue");
+            abort = false;
+            equal(reference, run(ctx.get(), input, 0, true));
+            abort = true;
+            require(llama_decode(ctx.get(), llama_batch_get_one(answer.data(), answer.size())) == 2, "answer abort returned");
+            require(llama_memory_seq_pos_max(mem, 0) == -1, "answer abort clears prefix and answer KV");
+            abort = false;
+            equal(reference, run(ctx.get(), input, 0, true));
+            llama_set_abort_callback(ctx.get(), nullptr, nullptr);
+            params.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+            llama_context_ptr bidir(llama_init_from_model(model, params));
+            require(bool(bidir), "bidirectional context");
+            equal(reference, run(bidir.get(), input, 0, false));
+            require(llama_decode_prefix(bidir.get(), llama_batch_get_one(input.data(), input.size())) == -1, "prefix API requires prefix mode");
+            params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+            llama_context_ptr causal(llama_init_from_model(model, params));
+            require(bool(causal), "causal context");
+            auto causal_ref = run(causal.get(), input, 0, false);
+            llama_memory_clear(llama_get_memory(causal.get()), true);
+            auto causal_changed = run(causal.get(), changed_input, 0, false);
+            equal(std::vector<float>(causal_ref.begin(), causal_ref.begin() + n_vocab),
+                  std::vector<float>(causal_changed.begin(), causal_changed.begin() + n_vocab));
+            params.attention_type = LLAMA_ATTENTION_TYPE_PREFIX_LM;
+            params.n_seq_max = 2;
+            params.n_ctx = 256;
+            for (bool unified : {false, true}) {
+                params.kv_unified = unified;
+                llama_context_ptr multi(llama_init_from_model(model, params));
+                require(bool(multi), "parallel PrefixLM context");
+                auto * mm = llama_get_memory(multi.get());
+                require(llama_n_ctx_seq(multi.get()) == (unified ? 256u : 128u), "per-sequence capacity");
+                const llama_seq_id other = unified ? 7 : 1;
+                auto other_input = std::vector<llama_token>(changed_input.begin(), changed_input.begin() + 5);
+                auto other_ref = run(ctx.get(), other_input, 0, true);
+                auto other_answer = run(ctx.get(), answer, other_input.size(), false);
+                // One logical batch combines a new prefix, its own answer, and another live answer.
+                run(multi.get(), other_input, 0, true, other);
+                auto phase_batch = llama_batch_init(input.size() + 2 * answer.size(), 0, 1);
+                for (size_t i = 0; i < input.size(); ++i) { common_batch_add(phase_batch, input[i], i, {0}, true); }
+                for (size_t i = 0; i < answer.size(); ++i) {
+                    common_batch_add(phase_batch, answer[i], input.size() + i, {0}, true);
+                    common_batch_add(phase_batch, answer[i], other_input.size() + i, {other}, true);
+                }
+                const llama_seq_id new_seq = 0;
+                const llama_pos end = input.size();
+                require(llama_decode_prefix_mixed(multi.get(), phase_batch, &new_seq, &end, 1) == 0, "mixed prefix and answer phases");
+                for (size_t i = 0; i < size_t(phase_batch.n_tokens); ++i) {
+                    const auto & want = i < input.size() ? reference : ((i - input.size()) % 2 ? other_answer : chunk);
+                    const size_t row = i < input.size() ? i : (i - input.size()) / 2;
+                    const float * got = llama_get_logits_ith(multi.get(), i);
+                    equal(std::vector<float>(want.begin() + row * n_vocab, want.begin() + (row + 1) * n_vocab),
+                          std::vector<float>(got, got + n_vocab));
+                }
+                const llama_pos absent_end = input.size() + answer.size() + 1;
+                require(llama_decode_prefix_mixed(multi.get(), phase_batch, &new_seq, &absent_end, 1) == -1,
+                        "incomplete declared prefix rejected before mutation");
+                require(llama_memory_seq_pos_max(mm, other) == 8, "invalid mixed batch preserves unrelated answer");
+                llama_batch_free(phase_batch);
+                llama_memory_clear(mm, false);
+                if (unified) {
+                    auto shared = llama_batch_init(input.size() + answer.size(), 0, 2);
+                    for (size_t i = 0; i < input.size(); ++i) { common_batch_add(shared, input[i], i, {0, other}, true); }
+                    require(llama_decode_prefix(multi.get(), shared) == 0, "shared complete prefix");
+                    for (size_t i = 0; i < input.size(); ++i) {
+                        const auto * got = llama_get_logits_ith(multi.get(), i);
+                        equal(std::vector<float>(reference.begin() + i*n_vocab, reference.begin() + (i+1)*n_vocab),
+                              std::vector<float>(got, got + n_vocab));
+                    }
+                    common_batch_clear(shared);
+                    for (size_t i = 0; i < answer.size(); ++i) { common_batch_add(shared, answer[i], input.size()+i, {other, 0}, true); }
+                    require(llama_decode(multi.get(), shared) == 0, "shared causal answers with reordered owners");
+                    for (size_t i = 0; i < answer.size(); ++i) {
+                        const auto * got = llama_get_logits_ith(multi.get(), i);
+                        equal(std::vector<float>(chunk.begin() + i*n_vocab, chunk.begin() + (i+1)*n_vocab),
+                              std::vector<float>(got, got + n_vocab));
+                    }
+                    require(llama_get_logits_seq(multi.get(), 0) && llama_get_logits_seq(multi.get(), other), "logits saved for all owners");
+                    std::vector<uint8_t> ownership(llama_state_get_size(multi.get()));
+                    require(llama_state_get_data(multi.get(), ownership.data(), ownership.size()) == ownership.size(), "save shared ownership");
+                    llama_memory_clear(mm, false);
+                    require(llama_state_set_data(multi.get(), ownership.data(), ownership.size()) == ownership.size(), "restore shared ownership");
+
+                    common_batch_clear(shared);
+                    for (size_t i = 0; i + 1 < input.size(); ++i) { common_batch_add(shared, input[i], i, {0, other}, true); }
+                    common_batch_add(shared, input.back(), input.size()-1, {0}, true);
+                    common_batch_add(shared, input.back(), input.size()-1, {other}, true);
+                    require(llama_decode_prefix(multi.get(), shared) == -1, "shared prefix with different future dependencies rejected");
+                    require(llama_memory_seq_pos_max(mm, 0) == 11 && llama_memory_seq_pos_max(mm, other) == 11, "invalid shared prefix preserves owners");
+                    common_batch_clear(shared);
+                    common_batch_add(shared, answer[0], 12, {0, 0}, true);
+                    require(llama_decode(multi.get(), shared) == -1, "duplicate owner rejected");
+                    shared.seq_id[0][1] = other;
+                    require(llama_decode(multi.get(), shared) == 0, "shared answer after state restore");
+                    llama_memory_clear(mm, false);
+                    run(multi.get(), input, 0, true);
+                    auto different = input; different.back() = (different.back()+1) % n_vocab;
+                    run(multi.get(), different, 0, true, other);
+                    shared.pos[0] = input.size();
+                    require(llama_decode(multi.get(), shared) == -1, "equal positions do not prove identical histories");
+                    llama_memory_seq_cp(mm, 0, other, input.size(), input.size()+1);
+                    require(llama_memory_seq_pos_max(mm, other) == 7, "empty answer range is a no-op");
+                    llama_batch_free(shared);
+                    llama_memory_clear(mm, false);
+                }
+                // Persistence and forks reuse the public state APIs and must preserve phase and branch isolation.
+                equal(reference, run(multi.get(), input, 0, true));
+                llama_memory_seq_cp(mm, 0, other, 1, -1);
+                require(llama_memory_seq_pos_max(mm, other) == -1, "partial fork rejected");
+                llama_memory_seq_cp(mm, 0, other, 0, input.size());
+                require(llama_memory_seq_pos_max(mm, other) == 7, "complete finite-range fork");
+                // Save immediately: separate-stream copy buffers have not yet been used by decode.
+                std::vector<uint8_t> seq_state(llama_state_seq_get_size(multi.get(), other));
+                require(llama_state_seq_get_data(multi.get(), seq_state.data(), seq_state.size(), other) == seq_state.size(), "save pending fork");
+                equal(chunk, run(multi.get(), answer, input.size(), false, other));
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                llama_memory_seq_cp(mm, 0, other, 0, input.size() - 1);
+                require(llama_memory_seq_pos_max(mm, other) == 11, "incomplete prefix copy preserves destination");
+                llama_memory_seq_cp(mm, 0, other, 0, input.size() + 1);
+                require(llama_memory_seq_pos_max(mm, other) == 8, "bounded copy includes complete prefix and answer head");
+                require(!llama_get_logits_seq(multi.get(), other), "bounded copy invalidates unavailable boundary logits");
+                equal(std::vector<float>(chunk.begin() + n_vocab, chunk.end()),
+                      run(multi.get(), std::vector<llama_token>(answer.begin()+1, answer.end()), input.size()+1, false, other));
+                if (unified) {
+                    llama_memory_seq_cp(mm, 0, other, 0, input.size());
+                    llama_memory_seq_cp(mm, 0, other, input.size(), input.size()+2);
+                    require(llama_memory_seq_pos_max(mm, other) == 9, "answer-only copy with identical preceding KV");
+                    equal(std::vector<float>(chunk.begin() + 2*n_vocab, chunk.end()),
+                          run(multi.get(), std::vector<llama_token>(answer.begin()+2, answer.end()), input.size()+2, false, other));
+                }
+                llama_memory_seq_cp(mm, 0, other, 0, -1);
+                require(llama_memory_seq_rm(mm, other, input.size(), -1), "fork after answers preserves prefix boundary");
+                equal(changed, run(multi.get(), changed_answer, input.size(), false, other));
+                require(llama_memory_seq_pos_max(mm, 0) == 11, "branch rollback preserves source answer");
+                require(llama_state_seq_set_data(multi.get(), seq_state.data(), seq_state.size(), other) == seq_state.size(), "restore fork");
+                require(llama_memory_seq_pos_max(mm, 0) == 11, "sequence restore preserves source");
+                equal(chunk, run(multi.get(), answer, input.size(), false, other));
+                require(llama_state_seq_set_data(multi.get(), seq_state.data(), seq_state.size(), 0) == seq_state.size(), "restore remaps sequence ID");
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                auto bad_state = seq_state;
+                require(llama_state_seq_get_size(multi.get(), -1) == 0, "negative sequence state ID rejected");
+                require(llama_state_seq_get_size_ext(multi.get(), other, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == 0, "device snapshot flags rejected");
+                // Prefix envelope: magic, source ID, version, signature, count, then ID/end/next.
+                const size_t boundary_offset = 4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(llama_seq_id);
+                const llama_pos invalid_end = 0;
+                std::memcpy(bad_state.data() + boundary_offset, &invalid_end, sizeof(invalid_end));
+                require(llama_state_seq_set_data(multi.get(), bad_state.data(), bad_state.size(), other) == 0, "invalid prefix boundary rejected");
+                require(llama_memory_seq_pos_max(mm, other) == 11, "metadata rejection preserves destination");
+                bad_state = seq_state;
+                // Corrupt the second KV position into a duplicate of the first (both endpoints stay intact).
+                const size_t kv_offset = boundary_offset + 2 * sizeof(llama_pos);
+                const size_t first_position = kv_offset + (unified ? 2 : 3) * sizeof(uint32_t);
+                const llama_pos duplicate_pos = 0;
+                std::memcpy(bad_state.data() + first_position + 3 * sizeof(uint32_t), &duplicate_pos, sizeof(duplicate_pos));
+                require(llama_state_seq_set_data(multi.get(), bad_state.data(), bad_state.size(), other) == 0, "duplicate interior KV position rejected");
+                require(llama_memory_seq_pos_max(mm, other) == -1 && llama_memory_seq_pos_max(mm, 0) == 11,
+                        "corrupt KV isolates destination");
+                require(llama_state_seq_set_data(multi.get(), seq_state.data(), seq_state.size(), other) == seq_state.size(), "restore after corrupt KV");
+                equal(chunk, run(multi.get(), answer, input.size(), false, other));
+                bad_state = seq_state;
+                bad_state[0] ^= 1;
+                require(llama_state_seq_set_data(multi.get(), bad_state.data(), bad_state.size(), other) == 0, "bad state magic rejected");
+                require(llama_memory_seq_pos_max(mm, other) == 11, "header rejection preserves destination");
+                require(llama_state_seq_set_data(multi.get(), seq_state.data(), seq_state.size() - 1, other) == 0, "truncated KV rejected");
+                require(llama_memory_seq_pos_max(mm, other) == -1 && llama_memory_seq_pos_max(mm, 0) == 11,
+                        "failed sequence restore invalidates destination only");
+                require(llama_state_seq_set_data(multi.get(), seq_state.data(), seq_state.size(), other) == seq_state.size(), "restore after failure");
+                std::vector<uint8_t> full_state(llama_state_get_size(multi.get()));
+                require(llama_state_get_data(multi.get(), full_state.data(), full_state.size()) == full_state.size(), "save concurrent context");
+                llama_memory_clear(mm, false);
+                require(llama_state_set_data(multi.get(), full_state.data(), full_state.size()) == full_state.size(), "restore concurrent context");
+                require(llama_memory_seq_pos_max(mm, 0) == 11 && llama_memory_seq_pos_max(mm, other) == 7, "restore independent phases");
+                equal(chunk, run(multi.get(), answer, input.size(), false, other));
+                require(llama_memory_seq_rm(mm, 0, input.size(), -1), "restored prefix boundary permits suffix trim");
+                require(!llama_memory_seq_rm(mm, 0, input.size() - 1, -1), "restored prefix boundary rejects edit");
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                require(llama_state_set_data(multi.get(), full_state.data(), full_state.size() - 1) == 0, "truncated context rejected");
+                require(llama_memory_seq_pos_max(mm, 0) == -1 && llama_memory_seq_pos_max(mm, other) == -1,
+                        "failed context restore invalidates all sequences");
+                llama_context_ptr restored(llama_init_from_model(model, params));
+                require(llama_state_set_data(restored.get(), full_state.data(), full_state.size()) == full_state.size(), "restore into fresh context");
+                const auto * restored_logits = llama_get_logits_seq(restored.get(), other);
+                require(restored_logits != nullptr, "fresh-context boundary logits restored");
+                equal(std::vector<float>(reference.end() - n_vocab, reference.end()),
+                      std::vector<float>(restored_logits, restored_logits + n_vocab));
+                equal(chunk, run(restored.get(), answer, input.size(), false, other));
+                const std::string state_file = "test-prefix-state-" + std::string(llm_arch_name(arch)) + "-" + std::to_string(seed) + ".bin";
+                run(multi.get(), input, 0, true);
+                require(llama_state_save_file(multi.get(), state_file.c_str(), input.data(), input.size()), "save context file");
+                llama_memory_clear(mm, false);
+                std::vector<llama_token> saved_tokens(input.size());
+                size_t saved_count = 0;
+                require(llama_state_load_file(multi.get(), state_file.c_str(), saved_tokens.data(), saved_tokens.size(), &saved_count), "load context file");
+                require(saved_tokens == input && saved_count == input.size(), "file tokens round trip");
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                run(multi.get(), input, 0, true);
+                require(llama_state_seq_save_file(multi.get(), state_file.c_str(), 0, input.data(), input.size()) > 0, "save sequence file");
+                require(llama_state_seq_load_file(multi.get(), state_file.c_str(), other, saved_tokens.data(), saved_tokens.size(), &saved_count) > 0, "load sequence file with remap");
+                equal(chunk, run(multi.get(), answer, input.size(), false, other));
+                std::remove(state_file.c_str());
+                // A new prefix on one fork must not change the source's KV.
+                equal(other_ref, run(multi.get(), other_input, 0, true, other));
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                auto causal_params = params;
+                causal_params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+                llama_context_ptr causal(llama_init_from_model(model, causal_params));
+                require(llama_state_set_data(causal.get(), full_state.data(), full_state.size()) == 0, "causal context rejects PrefixLM state");
+                require(llama_state_seq_set_data(causal.get(), seq_state.data(), seq_state.size(), 0) == 0, "causal context rejects PrefixLM sequence state");
+                run(causal.get(), input, 0, false);
+                run(causal.get(), other_input, 0, false, other);
+                std::vector<uint8_t> causal_state(llama_state_get_size(causal.get()));
+                require(llama_state_get_data(causal.get(), causal_state.data(), causal_state.size()) == causal_state.size(), "causal state still saves");
+                require(llama_state_set_data(multi.get(), causal_state.data(), causal_state.size()) == 0, "PrefixLM rejects causal context state");
+                require(llama_state_set_data(causal.get(), causal_state.data(), causal_state.size()) == causal_state.size(), "causal state still restores");
+                require(llama_memory_seq_pos_max(llama_get_memory(causal.get()), other) == llama_pos(other_input.size() - 1), "causal sparse ID state preserved");
+                require(llama_memory_seq_rm(mm, other, 0, -1), "clear sequence before empty save");
+                std::vector<uint8_t> empty_state(llama_state_seq_get_size(multi.get(), other));
+                require(llama_state_seq_get_data(multi.get(), empty_state.data(), empty_state.size(), other) == empty_state.size(), "save empty sequence");
+                require(llama_state_seq_set_data(multi.get(), empty_state.data(), empty_state.size(), 0) == empty_state.size(), "empty restore clears destination");
+                require(llama_memory_seq_pos_max(mm, 0) == -1, "empty restore clears KV and phase");
+                llama_memory_clear(mm, false);
+                equal(reference, run(multi.get(), input, 0, true));
+                equal(other_ref, run(multi.get(), other_input, 0, true, other));
+                require(llama_memory_seq_pos_max(mm, 0) == 7, "new prefix preserves other sequence");
+                auto mixed = llama_batch_init(2 * answer.size(), 0, 2);
+                for (size_t i = 0; i < answer.size(); ++i) {
+                    common_batch_add(mixed, answer[i], input.size() + i, {0}, true);
+                    common_batch_add(mixed, answer[i], other_input.size() + i, {other}, true);
+                }
+                require(llama_decode(multi.get(), mixed) == 0, "interleaved answer batch");
+                for (size_t i = 0; i < 2 * answer.size(); ++i) {
+                    const auto & want = i % 2 ? other_answer : chunk;
+                    const auto * got = llama_get_logits_ith(multi.get(), i);
+                    equal(std::vector<float>(want.begin() + (i / 2) * n_vocab, want.begin() + (i / 2 + 1) * n_vocab),
+                          std::vector<float>(got, got + n_vocab));
+                }
+                common_batch_clear(mixed);
+                common_batch_add(mixed, answer[0], 12, {0}, true);
+                common_batch_add(mixed, answer[0], 0, {other}, true);
+                require(llama_decode(multi.get(), mixed) == -1, "mixed invalid admission is atomic");
+                mixed.n_seq_id[0] = 2;
+                mixed.seq_id[0][1] = other;
+                require(llama_decode(multi.get(), mixed) == -1, "shared token with unequal histories rejected");
+                llama_batch_free(mixed);
+                require(!llama_memory_seq_rm(mm, -1, 6, -1), "wildcard invalid edit rejects atomically");
+                require(llama_memory_seq_pos_max(mm, 0) == 11 && llama_memory_seq_pos_max(mm, other) == 8,
+                        "wildcard rejection preserves both sequences");
+                require(llama_memory_seq_rm(mm, other, other_input.size(), -1), "local answer rollback");
+                equal(other_answer, run(multi.get(), answer, other_input.size(), false, other));
+                equal(reference, run(multi.get(), input, 0, true));
+                require(llama_memory_seq_pos_max(mm, other) == 8, "reset preserves other answer");
+                bool cancelled = true;
+                llama_set_abort_callback(multi.get(), [](void * data) { return *static_cast<bool *>(data); }, &cancelled);
+                auto failed = llama_batch_init(input.size(), 0, 1);
+                for (size_t i = 0; i < input.size(); ++i) { common_batch_add(failed, input[i], i, {other}, true); }
+                require(llama_decode_prefix(multi.get(), failed) == 2, "local prefix abort");
+                require(llama_memory_seq_pos_max(mm, other) == -1 && llama_memory_seq_pos_max(mm, 0) == 7,
+                        "abort isolates unrelated sequence");
+                cancelled = false;
+                equal(chunk, run(multi.get(), answer, input.size(), false));
+                // Complete prefixes may also share a batch, with separate sequence ownership.
+                common_batch_clear(failed);
+                for (size_t i = 0; i < 4; ++i) {
+                    common_batch_add(failed, input[i], i, {0}, true);
+                    common_batch_add(failed, input[i], i, {other}, true);
+                }
+                require(llama_decode_prefix(multi.get(), failed) == 0, "multiple complete prefixes");
+                auto short_ref = run(ctx.get(), std::vector<llama_token>(input.begin(), input.begin() + 4), 0, true);
+                for (int i = 0; i < 8; ++i) {
+                    const auto * got = llama_get_logits_ith(multi.get(), i);
+                    equal(std::vector<float>(short_ref.begin() + (i / 2) * n_vocab, short_ref.begin() + (i / 2 + 1) * n_vocab),
+                          std::vector<float>(got, got + n_vocab));
+                }
+                // Missing positions are inferred independently for each sequence.
+                auto * saved_pos = failed.pos;
+                failed.pos = nullptr;
+                require(llama_decode(multi.get(), failed) == 0, "implicit interleaved positions");
+                failed.pos = saved_pos;
+                cancelled = true;
+                common_batch_clear(failed);
+                common_batch_add(failed, answer[0], 8, {other}, true);
+                require(llama_decode(multi.get(), failed) == 2, "local answer abort");
+                cancelled = false;
+                require(llama_memory_seq_pos_max(mm, 0) == 7 && llama_memory_seq_pos_max(mm, other) == -1,
+                        "answer abort isolates unrelated sequence");
+                require(llama_decode(multi.get(), failed) == -1, "aborted sequence needs a new prefix");
+                llama_batch_free(failed);
+                run(multi.get(), other_input, 0, true, other);
+                llama_memory_seq_keep(mm, other);
+                require(llama_memory_seq_pos_max(mm, 0) == (unified ? -1 : 7), "keep follows cache stream ownership");
+                require(llama_decode(multi.get(), llama_batch_get_one(answer.data(), 1)) == (unified ? -1 : 0),
+                        "keep phase follows retained KV");
+                equal(other_answer, run(multi.get(), answer, other_input.size(), false, other));
+                require(llama_memory_seq_rm(mm, -1, 0, -1), "wildcard full removal");
+                require(llama_memory_seq_pos_max(mm, other) == -1, "wildcard removal clears sequences");
+                auto limited_params = params;
+                limited_params.n_ctx = 17;
+                llama_context_ptr limited(llama_init_from_model(model, limited_params));
+                require(bool(limited), "small parallel capacity");
+                run(limited.get(), input, 0, true);
+                run(limited.get(), other_input, 0, true, other);
+                if (unified) { run(limited.get(), answer, input.size(), false); }
+                auto overflow = llama_batch_init(1, 0, 1);
+                common_batch_add(overflow, answer[0], unified ? 5 : 8, {unified ? other : 0}, true);
+                require(llama_decode(limited.get(), overflow) == -1, "requested capacity enforced before padded allocation");
+                llama_batch_free(overflow);
+                require(llama_memory_seq_pos_max(llama_get_memory(limited.get()), 0) == (unified ? 11 : 7),
+                        "capacity rejection preserves sequence");
+            }
+        }
+    }
+    printf("%d PrefixLM engine checks passed (%s)\n", checks, llm_arch_name(arch));
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -837,8 +1519,12 @@ int main(int argc, char ** argv) {
     std::string out;
 
     int verbosity = LOG_LEVEL_ERROR;
+    bool prefix_lm = false;
+    std::string prefix_reference;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--prefix-reference") == 0 && i + 1 < argc) { prefix_reference = argv[++i]; continue; }
+        if (strcmp(argv[i], "--prefix-lm") == 0) { prefix_lm = true; }
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
@@ -884,6 +1570,8 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (!prefix_reference.empty()) { return test_prefix_reference(prefix_reference); }
+        if (prefix_lm) { return test_prefix_lm(arch, seed); }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }

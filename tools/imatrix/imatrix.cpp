@@ -1146,6 +1146,16 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // This tool consumes unlabelled text, so it has no PrefixLM boundary.
+    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+    }
+    if (params.attention_type != LLAMA_ATTENTION_TYPE_CAUSAL) {
+        LOG_ERR("%s: this tool requires causal attention; conditional PrefixLM scoring needs labelled prefix boundaries\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: using causal attention\n", __func__);
+
     llama_backend_init();
     llama_numa_init(params.numa);
 

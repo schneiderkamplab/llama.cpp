@@ -113,6 +113,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_ctx = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
     ctx_params.n_batch = n_prompt;
+    if (llama_model_is_prefix_lm(model)) { ctx_params.n_ubatch = n_prompt; }
     // enable performance counters
     ctx_params.no_perf = false;
 
@@ -170,7 +171,8 @@ int main(int argc, char ** argv) {
 
     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
-        if (llama_decode(ctx, batch)) {
+        const bool prefix = n_pos == 0 && llama_get_attention_type(ctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM;
+        if (prefix ? llama_decode_prefix(ctx, batch) : llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
