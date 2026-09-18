@@ -1047,6 +1047,84 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+#include "unicode-letter-case.h"
+
+static int unicode_letter_case(uint32_t cpt, unicode_cpt_flags flags) {
+    const auto * first = std::begin(unicode_letter_case_exceptions);
+    const auto * last = std::end(unicode_letter_case_exceptions);
+    auto it = std::upper_bound(first, last, cpt, [](uint32_t value, const auto & range) { return value < range.first; });
+    if (it != first && cpt <= (it - 1)->last) {
+        return (it - 1)->kind;
+    }
+    return flags.is_uppercase ? 1 : flags.is_lowercase ? 2 : 0;
+}
+
+static std::vector<size_t> unicode_regex_split_custom_mistral(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    std::vector<size_t> result;
+    size_t begin = 0;
+    for (size_t length : offsets) {
+        const size_t end = begin + length;
+        auto flags = [&](size_t i) { return i < end ? unicode_cpt_flags_from_cpt(cpts[i]) : unicode_cpt_flags{}; };
+        auto upper = [&](size_t i) {
+            const auto f = flags(i);
+            return i < end && (f.is_accent_mark || (f.is_letter && unicode_letter_case(cpts[i], f) != 2));
+        };
+        auto lower = [&](size_t i) {
+            const auto f = flags(i);
+            return i < end && (f.is_accent_mark || (f.is_letter && unicode_letter_case(cpts[i], f) != 1));
+        };
+        auto punctuation = [&](size_t i) { const auto f = flags(i); return i < end && !f.is_whitespace && !f.is_letter && !f.is_number; };
+        auto whitespace = [&](size_t i) { return i < end && flags(i).is_whitespace; };
+        size_t pos = begin;
+        while (pos < end) {
+            size_t next = pos;
+            const auto f = flags(pos);
+            const bool prefix = cpts[pos] != '\r' && cpts[pos] != '\n' && !f.is_letter && !f.is_number;
+            // Ordered regex alternatives: optional prefix, upper* lower+, upper+ lower*.
+            for (int pattern = 0; pattern < 2 && next == pos; ++pattern) {
+                for (int skip = prefix ? 1 : 0; skip >= 0 && next == pos; --skip) {
+                    size_t start = pos + skip, cursor = start;
+                    while (upper(cursor)) { ++cursor; }
+                    if (pattern == 0) {
+                        while (cursor > start && !lower(cursor)) { --cursor; }
+                        if (lower(cursor)) {
+                            while (lower(cursor)) { ++cursor; }
+                            next = cursor;
+                        }
+                    } else if (cursor > start) {
+                        while (lower(cursor)) { ++cursor; }
+                        next = cursor;
+                    }
+                }
+            }
+            if (next == pos && f.is_number) { next = pos + 1; }
+            if (next == pos) {
+                size_t cursor = pos + (cpts[pos] == ' ' ? 1 : 0);
+                if (punctuation(cursor)) {
+                    while (punctuation(cursor)) { ++cursor; }
+                    while (cursor < end && (cpts[cursor] == '\r' || cpts[cursor] == '\n' || cpts[cursor] == '/')) { ++cursor; }
+                    next = cursor;
+                }
+            }
+            if (next == pos && f.is_whitespace) {
+                size_t cursor = pos, newline_end = pos;
+                while (whitespace(cursor)) {
+                    if (cpts[cursor] == '\r' || cpts[cursor] == '\n') { newline_end = cursor + 1; }
+                    ++cursor;
+                }
+                if (newline_end > pos) { next = newline_end; }
+                else { next = cursor < end && cursor - pos > 1 ? cursor - 1 : cursor; }
+            }
+            if (next == pos) { ++next; }
+            result.push_back(next - pos);
+            pos = next;
+        }
+        begin = end;
+    }
+    return result;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -1062,6 +1140,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (
            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_qwen35(text, offsets);
+    } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_mistral(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);

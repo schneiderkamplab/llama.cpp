@@ -1,5 +1,6 @@
 #include "jinja/string.h"
 #include "jinja/value.h"
+#include "unicode.h"
 
 #include <algorithm>
 #include <functional>
@@ -162,21 +163,34 @@ string string::titlecase() {
 }
 string string::strip(bool left, bool right, std::optional<const std::string_view> chars) {
     static auto strip_part = [](const std::string & s, bool left, bool right, std::optional<const std::string_view> chars) -> std::string {
-        size_t start = 0;
-        size_t end = s.length();
-        auto match_char = [&chars](unsigned char c) -> bool {
-            return chars ? (*chars).find(c) != std::string::npos : isspace(c);
+        std::vector<uint32_t> strip_chars;
+        if (chars) {
+            for (size_t i = 0; i < chars->size();) {
+                auto cp = common_parse_utf8_codepoint(*chars, i);
+                strip_chars.push_back(cp.status == utf8_parse_result::SUCCESS ? cp.codepoint : uint8_t((*chars)[i]));
+                i += cp.status == utf8_parse_result::SUCCESS ? cp.bytes_consumed : 1;
+            }
+        }
+        auto match_char = [&](uint32_t c) -> bool {
+            if (chars) {
+                return std::find(strip_chars.begin(), strip_chars.end(), c) != strip_chars.end();
+            }
+            // Python str.strip() whitespace, independent of the process locale.
+            return (c >= 0x09 && c <= 0x0d) || (c >= 0x1c && c <= 0x20) || c == 0x85 ||
+                   c == 0xa0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+                   c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000;
         };
-        if (left) {
-            while (start < end && match_char(static_cast<unsigned char>(s[start]))) {
-                ++start;
-            }
+        std::vector<std::pair<size_t, bool>> points;
+        for (size_t i = 0; i < s.size();) {
+            auto cp = common_parse_utf8_codepoint(s, i);
+            points.emplace_back(i, cp.status == utf8_parse_result::SUCCESS && match_char(cp.codepoint));
+            i += cp.status == utf8_parse_result::SUCCESS ? cp.bytes_consumed : 1;
         }
-        if (right) {
-            while (end > start && match_char(static_cast<unsigned char>(s[end - 1]))) {
-                --end;
-            }
-        }
+        size_t first = 0, last = points.size();
+        if (left) { while (first < last && points[first].second) { ++first; } }
+        if (right) { while (last > first && points[last - 1].second) { --last; } }
+        const size_t start = first < points.size() ? points[first].first : s.size();
+        const size_t end = last < points.size() ? points[last].first : s.size();
         return s.substr(start, end - start);
     };
     if (parts.empty()) {
