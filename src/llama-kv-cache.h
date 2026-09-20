@@ -20,7 +20,7 @@ struct llama_context;
 class llama_kv_cache : public llama_memory_i {
 public:
     int64_t prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced = {},
-                        llama_seq_id copy_dst = -1) const override;
+                        llama_seq_id copy_dst = -1, const std::map<llama_seq_id, llama_pos> & retained_ends = {}) const override;
 
     struct stream_copy_info {
         bool empty() const {

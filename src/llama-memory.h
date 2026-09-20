@@ -107,10 +107,10 @@ struct llama_memory_i {
     }
     bool prefix_batch = false;
     virtual int64_t prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced = {},
-                                llama_seq_id copy_dst = -1) const {
+                                llama_seq_id copy_dst = -1, const std::map<llama_seq_id, llama_pos> & retained_ends = {}) const {
         int64_t used = 0;
         for (const auto & entry : states) { used += entry.second.next; }
-        (void) replaced; (void) copy_dst;
+        (void) replaced; (void) copy_dst; (void) retained_ends;
         return used;
     }
     virtual bool prefix_same(llama_seq_id a, llama_seq_id b, llama_pos end) const {

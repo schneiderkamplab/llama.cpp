@@ -450,7 +450,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 int64_t llama_kv_cache::prefix_used(const prefix_states & states, const std::set<llama_seq_id> & replaced,
-                                   llama_seq_id copy_dst) const {
+                                   llama_seq_id copy_dst, const std::map<llama_seq_id, llama_pos> & retained_ends) const {
     // Answer-only appends normally need no cell scan. Use actual KV positions so this
     // also remains correct when validating a just-restored full-context snapshot.
     if (replaced.empty() && copy_dst < 0 && states.size() == prefix_sequences.size()) {
@@ -474,7 +474,8 @@ int64_t llama_kv_cache::prefix_used(const prefix_states & states, const std::set
             if (cells.is_empty(i)) { continue; }
             bool keep = false;
             for (const auto & entry : states) {
-                if (entry.first == copy_dst || replaced.count(entry.first)) { continue; }
+                if (entry.first == copy_dst || (replaced.count(entry.first) &&
+                    (!retained_ends.count(entry.first) || cells.pos_get(i) >= retained_ends.at(entry.first)))) { continue; }
                 if (cells.seq_has(i, entry.first) && cells.pos_get(i) < entry.second.next) {
                     ++retained[entry.first];
                     keep = true;

@@ -1006,10 +1006,11 @@ static int test_prefix_lm(const llm_arch arch, size_t seed) {
             auto * mem = llama_get_memory(ctx.get());
             auto input = get_tokens(8, n_vocab, seed);
             auto answer = get_tokens(4, n_vocab, seed + 1);
-            auto run = [&](llama_context * target, const std::vector<llama_token> & tokens, int pos, bool prefix, llama_seq_id seq = 0) {
+            auto run = [&](llama_context * target, const std::vector<llama_token> & tokens, int pos, bool prefix, llama_seq_id seq = 0, bool mixed = false) {
                 auto batch = llama_batch_init(tokens.size(), 0, 1);
                 for (size_t i = 0; i < tokens.size(); ++i) { common_batch_add(batch, tokens[i], pos + i, {seq}, true); }
-                const int code = prefix ? llama_decode_prefix(target, batch) : llama_decode(target, batch);
+                const int code = mixed ? llama_decode_mixed_lm(target, batch) :
+                    prefix ? llama_decode_prefix(target, batch) : llama_decode(target, batch);
                 llama_batch_free(batch);
                 require(code == 0, "decode");
                 std::vector<float> result;
@@ -1023,6 +1024,77 @@ static int test_prefix_lm(const llm_arch arch, size_t seed) {
                 require(nmse(a, b) < 1e-6, "logit parity");
             };
             require(llama_decode(ctx.get(), llama_batch_get_one(input.data(), input.size())) == -1, "answer without prefix rejected");
+            // Independent oracle: freeze older KV, use noncausal attention only for each new block.
+            {
+                require(!params.mixed_lm, "MixedLM defaults off");
+                require(llama_decode_mixed_lm(ctx.get(), llama_batch_get_one(input.data(), input.size())) == -1,
+                        "MixedLM requires explicit opt-in");
+                auto mp = params;
+                mp.mixed_lm = true;
+                llama_context_ptr mixed(llama_init_from_model(model, mp));
+                require(bool(mixed), "create MixedLM context");
+                require(llama_decode_mixed_lm(mixed.get(), llama_batch_get_one(input.data(), input.size())) == -1,
+                        "MixedLM requires an existing prefix");
+                auto rp = params;
+                rp.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+                llama_context_ptr oracle(llama_init_from_model(model, rp));
+                require(bool(oracle), "create block attention oracle");
+                rp.mixed_lm = true;
+                llama_context_ptr invalid(llama_init_from_model(model, rp));
+                require(!invalid, "MixedLM rejects ordinary causal contexts");
+                llama_set_causal_attn(oracle.get(), false);
+                equal(run(oracle.get(), input, 0, false), run(mixed.get(), input, 0, true));
+                llama_set_causal_attn(oracle.get(), true);
+                equal(run(oracle.get(), answer, input.size(), false), run(mixed.get(), answer, input.size(), false));
+                auto suffix = answer;
+                auto user = get_tokens(5, n_vocab, seed + 9);
+                suffix.insert(suffix.end(), user.begin(), user.end());
+                require(llama_memory_seq_rm(llama_get_memory(oracle.get()), 0, input.size(), -1), "trim oracle answer");
+                llama_set_causal_attn(oracle.get(), false);
+                equal(run(oracle.get(), suffix, input.size(), false), run(mixed.get(), suffix, input.size(), false, 0, true));
+                const int end = input.size() + suffix.size();
+                auto bad = llama_batch_init(1, 0, 1);
+                common_batch_add(bad, answer[0], end + 1, {0}, true);
+                require(llama_decode_mixed_lm(mixed.get(), bad) == -1, "MixedLM rejects noncontiguous suffix");
+                llama_batch_free(bad);
+                require(llama_memory_seq_pos_max(llama_get_memory(mixed.get()), 0) == end - 1, "invalid suffix preserves KV");
+                std::vector<uint8_t> snapshot(llama_state_get_size(mixed.get()));
+                require(llama_state_get_data(mixed.get(), snapshot.data(), snapshot.size()) == snapshot.size(), "save MixedLM state");
+                require(llama_state_set_data(ctx.get(), snapshot.data(), snapshot.size()) == 0, "exact context rejects approximate state");
+                auto third = get_tokens(3, n_vocab, seed + 10);
+                auto expected = run(oracle.get(), third, end, false);
+                equal(expected, run(mixed.get(), third, end, false, 0, true));
+                llama_memory_clear(llama_get_memory(mixed.get()), false);
+                require(llama_state_set_data(mixed.get(), snapshot.data(), snapshot.size()) == snapshot.size(), "restore MixedLM state");
+                equal(expected, run(mixed.get(), third, end, false, 0, true));
+                llama_set_causal_attn(oracle.get(), true);
+                equal(run(oracle.get(), answer, end + third.size(), false), run(mixed.get(), answer, end + third.size(), false));
+                run(ctx.get(), input, 0, true);
+                std::vector<uint8_t> exact(llama_state_get_size(ctx.get()));
+                require(llama_state_get_data(ctx.get(), exact.data(), exact.size()) == exact.size(), "save exact prefix");
+                require(llama_state_set_data(mixed.get(), exact.data(), exact.size()) == 0, "MixedLM rejects incompatible exact envelope");
+                equal(run(ctx.get(), input, 0, true), run(mixed.get(), input, 0, true));
+                bool abort = true;
+                llama_set_abort_callback(mixed.get(), [](void * data) { return *static_cast<bool *>(data); }, &abort);
+                require(llama_decode_mixed_lm(mixed.get(), llama_batch_get_one(suffix.data(), suffix.size())) != 0, "MixedLM abort");
+                require(llama_memory_seq_pos_max(llama_get_memory(mixed.get()), 0) == -1, "MixedLM abort clears affected KV");
+                abort = false;
+                equal(run(ctx.get(), input, 0, true), run(mixed.get(), input, 0, true));
+                // Shared frozen cells and shared new rows each consume capacity once.
+                mp.n_ctx = 16; mp.n_seq_max = 2; mp.kv_unified = true;
+                llama_context_ptr shared(llama_init_from_model(model, mp));
+                require(bool(shared), "create shared MixedLM context");
+                auto batch = llama_batch_init(8, 0, 2);
+                for (int i = 0; i < 8; ++i) { common_batch_add(batch, input[i], i, {0, 7}, true); }
+                require(llama_decode_prefix(shared.get(), batch) == 0, "shared MixedLM initial prefix");
+                common_batch_clear(batch);
+                for (int i = 0; i < 4; ++i) { common_batch_add(batch, answer[i], 8 + i, {0, 7}, true); }
+                require(llama_decode(shared.get(), batch) == 0, "shared MixedLM causal answer");
+                require(llama_decode_mixed_lm(shared.get(), batch) == 0, "shared MixedLM capacity counts retained KV once");
+                require(llama_memory_seq_pos_max(llama_get_memory(shared.get()), 7) == 11, "shared suffix positions");
+                llama_batch_free(batch);
+                llama_memory_clear(mem, false);
+            }
             auto reference = run(ctx.get(), input, 0, true);
             auto chunk = run(ctx.get(), answer, input.size(), false);
             run(ctx.get(), input, 0, true);

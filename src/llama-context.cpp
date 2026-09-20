@@ -238,6 +238,10 @@ llama_context::llama_context(
          hparams.n_swa != 0 || hparams.n_pos_per_embd() != 1)) {
         throw std::runtime_error("PrefixLM requires token sequences and a full-attention decoder");
     }
+    mixed_lm = params.mixed_lm;
+    if (mixed_lm && attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        throw std::runtime_error("MixedLM requires a PrefixLM context");
+    }
     cparams.causal_attn = attention_type != LLAMA_ATTENTION_TYPE_NON_CAUSAL;
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -1742,7 +1746,28 @@ int llama_context::decode_prefix_mixed(const llama_batch & batch, const llama_se
     return decode_prefix_lm(batch, prefixes);
 }
 
-int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<llama_seq_id, llama_pos> & prefixes) {
+int llama_context::decode_mixed_lm(const llama_batch & batch) {
+    if (!mixed_lm || !memory || !batch.token || batch.embd || batch.n_tokens <= 0 ||
+        uint32_t(batch.n_tokens) > cparams.n_ubatch || uint32_t(batch.n_tokens) > cparams.n_batch) { return -1; }
+    std::map<llama_seq_id, llama_pos> prefixes;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const int count = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+        if (count <= 0 || uint32_t(count) > cparams.n_seq_max ||
+            (count > 1 && !batch.seq_id) || (batch.seq_id && !batch.seq_id[i])) { return -1; }
+        for (int j = 0; j < count; ++j) {
+            const auto id = batch.seq_id ? batch.seq_id[i][j] : 0;
+            const auto old = memory->prefix_sequences.find(id);
+            if (old == memory->prefix_sequences.end()) { return -1; }
+            auto entry = prefixes.emplace(id, old->second.end).first;
+            if (entry->second == std::numeric_limits<llama_pos>::max() ||
+                uint32_t(entry->second) >= prefix_context_limit) { return -1; }
+            ++entry->second;
+        }
+    }
+    return decode_prefix_lm(batch, prefixes, true);
+}
+
+int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<llama_seq_id, llama_pos> & prefixes, bool extend) {
     const bool prefix = !prefixes.empty();
     if (!batch.token || batch.embd || batch.n_tokens <= 0 ||
         uint32_t(batch.n_tokens) > cparams.n_batch ||
@@ -1764,6 +1789,11 @@ int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<ll
     };
     try {
         auto next = memory->prefix_sequences;
+        std::map<llama_seq_id, llama_pos> retained_ends;
+        if (extend) {
+            for (const auto & entry : prefixes) { retained_ends[entry.first] = next.at(entry.first).end; }
+        }
+        const auto prefix_start = [&](llama_seq_id id) { return extend ? retained_ends.at(id) : 0; };
         std::vector<llama_pos> positions(batch.n_tokens);
         const auto seq_limit = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
         std::map<llama_seq_id, std::vector<int32_t>> rows;
@@ -1778,7 +1808,7 @@ int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<ll
                 const llama_seq_id seq = batch.seq_id ? batch.seq_id[i][j] : 0;
                 if (seq < 0 || uint32_t(seq) >= seq_limit || !owners.insert(seq).second) { return -1; }
                 if (touched.insert(seq).second) {
-                    if (prefixes.count(seq)) { next[seq] = {prefixes.at(seq), 0, {}}; }
+                    if (prefixes.count(seq)) { next[seq] = {prefixes.at(seq), prefix_start(seq), {}}; }
                     else if (!next.count(seq)) { return -1; }
                 }
                 auto & state = next.at(seq);
@@ -1796,8 +1826,8 @@ int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<ll
             for (int j = 1; j < count; ++j) {
                 const auto a = batch.seq_id[i][0], b = batch.seq_id[i][j];
                 if (prefixes.count(a) != prefixes.count(b) || next.at(a).end != next.at(b).end) { return -1; }
-                const llama_pos start_a = prefixes.count(a) ? 0 : memory->prefix_sequences.at(a).next;
-                const llama_pos start_b = prefixes.count(b) ? 0 : memory->prefix_sequences.at(b).next;
+                const llama_pos start_a = prefixes.count(a) ? prefix_start(a) : memory->prefix_sequences.at(a).next;
+                const llama_pos start_b = prefixes.count(b) ? prefix_start(b) : memory->prefix_sequences.at(b).next;
                 if (start_a != start_b) { return -1; }
                 const auto key = std::make_pair(std::min(a, b), std::max(a, b));
                 const auto previous = checked.emplace(key, 0);
@@ -1817,9 +1847,11 @@ int llama_context::decode_prefix_lm(const llama_batch & batch, const std::map<ll
             replaced.insert(entry.first);
         }
         if (!memory->prefix_valid(next) || (memory->prefix_unified &&
-            memory->prefix_used(next, replaced) - shared_rows > prefix_context_limit)) { return -1; }
+            memory->prefix_used(next, replaced, -1, retained_ends) - shared_rows > prefix_context_limit)) { return -1; }
         executing = true;
-        for (const auto id : replaced) { memory->seq_rm(id, 0, -1); }
+        for (const auto id : replaced) {
+            if (!memory->seq_rm(id, prefix_start(id), -1)) { reset(); return -3; }
+        }
         memory->prefix_sequences = next; // mask construction needs boundaries before graph execution
         memory->prefix_batch = prefix;
         set_causal_attn(true);
@@ -3577,7 +3609,7 @@ size_t llama_context::prefix_state_write(llama_io_write_i & io, llama_seq_id seq
     // Cross-stream forks defer their buffer copies until a memory update.
     memory_update(false);
     synchronize();
-    const uint32_t version = 2;
+    const uint32_t version = mixed_lm ? 3 : 2;
     const uint64_t signature = prefix_adapter_signature();
     const auto & states = memory->prefix_sequences;
     const uint32_t count = seq_id < 0 ? states.size() : states.count(seq_id);
@@ -3610,7 +3642,7 @@ size_t llama_context::prefix_state_read(llama_io_read_i & io, llama_seq_id seq_i
     io.read(&version, sizeof(version));
     io.read(&signature, sizeof(signature));
     io.read(&count, sizeof(count));
-    if (version != 2 || signature != prefix_adapter_signature() ||
+    if (version != (mixed_lm ? 3u : 2u) || signature != prefix_adapter_signature() ||
         count > (seq_id < 0 ? memory->prefix_max_sequences : 1u)) {
         throw std::runtime_error("incompatible PrefixLM state version, adapters or sequence count");
     }
@@ -4072,6 +4104,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.mixed_lm                    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4871,4 +4904,8 @@ int32_t llama_decode_prefix_mixed(llama_context * ctx, llama_batch batch,
 
 int32_t llama_decode_prefix(llama_context * ctx, llama_batch batch) {
     return ctx->decode_prefix(batch);
+}
+
+int32_t llama_decode_mixed_lm(llama_context * ctx, llama_batch batch) {
+    return ctx->decode_mixed_lm(batch);
 }

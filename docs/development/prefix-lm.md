@@ -250,3 +250,29 @@ The same reader accepts real-model and quantized-model references. A failure
 against a strict full-precision tolerance is retained as a failure; quantized
 logit drift must be assessed separately from attention semantics and language
 quality. Optional `logits_dir` writes the tested rows for additional comparisons. A step may specify `rewind_to` to remove an answer suffix before decoding its tokens.
+
+## Experimental MixedLM (opt-in)
+
+Set `llama_context_params.mixed_lm = true` before creating a PrefixLM context.
+After an initial `llama_decode_prefix`, `llama_decode_mixed_lm` retains the old
+prompt KV and replaces its causal answer with a new bidirectional suffix. Pass
+the previous assistant answer again, followed by the new user prompt and
+assistant header, using the model's chat template. Suffix positions begin at the
+previous prefix end. The whole suffix must fit `n_ubatch` and `n_batch`.
+
+This approximates full PrefixLM: frozen older representations cannot attend to
+the new suffix. It can change answer quality. The caller must check that all
+frozen tokens are unchanged. Use `llama_decode_prefix` for a full refresh after
+history edits or other invalidation. New answer tokens use `llama_decode`.
+This option defaults false and has no server CLI integration.
+
+Admission, shared-owner dependency checks and error isolation reuse the existing
+PrefixLM path. Retained shared KV cells count once toward capacity. Exact mode
+keeps snapshot version 2; MixedLM uses version 3 and rejects cross-mode restore.
+Clients must rebuild against the changed context parameter structure.
+
+`test-llama-archs --prefix-lm --arch hrm_text --seed 42` (also `--arch llama`)
+checks the approximation against an independent blockwise noncausal oracle,
+repeated extension, causal continuation, full refresh, opt-in rejection, invalid
+positions, abort recovery, state restore and shared-cell capacity, with flash
+attention both enabled and disabled. It does not establish model-quality parity.

@@ -407,6 +407,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool mixed_lm;    // experimental approximate PrefixLM suffix reuse; disabled by default
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1031,6 +1032,16 @@ extern "C" {
     // be included; a batch containing any new prefix must fit n_ubatch. No duplicate listed IDs.
     LLAMA_API int32_t llama_decode_prefix_mixed(struct llama_context * ctx, struct llama_batch batch,
             const llama_seq_id * seq_ids, const llama_pos * prefix_ends, size_t n_prefixes);
+
+    // Experimental MixedLM: requires params.mixed_lm and an existing complete prefix per sequence.
+    // Keep KV at [0, previous_prefix_end), discard its causal answer, and replace it with this suffix.
+    // Suffix tokens attend to frozen KV and bidirectionally to each other; subsequent llama_decode is causal.
+    // Supply the previous answer again, followed by the new prompt, using the model's chat template.
+    // Positions start at previous_prefix_end (or are inferred); the complete suffix batch must fit n_ubatch.
+    // Callers must verify the frozen token prefix is unchanged. This is NOT exact full-prefix recomputation.
+    // Validation, failure isolation, and shared-owner rules match llama_decode_prefix.
+    // Use llama_decode_prefix for a full refresh. MixedLM state cannot restore into an exact PrefixLM context.
+    LLAMA_API int32_t llama_decode_mixed_lm(struct llama_context * ctx, struct llama_batch batch);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
