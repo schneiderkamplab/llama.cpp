@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 
 from typing import Iterable, TYPE_CHECKING
 
@@ -28,6 +29,23 @@ class HrmTextModel(TextModel):
         # 2 * layers_per_stack physical blocks
         self.block_count = self.layers_per_stack * self.h_cycles * (self.l_cycles + 1)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, 2 * self.layers_per_stack)
+
+    def load_vocab_tokenizer(self):
+        # Training reads tokenizer.json directly. Exported AutoTokenizer flags
+        # (notably fix_mistral_regex) must not rewrite that training graph.
+        from transformers import PreTrainedTokenizerFast
+        return PreTrainedTokenizerFast(tokenizer_file=str(self.dir_model / "tokenizer.json"))
+
+    def get_vocab_base_pre(self, tokenizer) -> str:
+        backend = json.loads(tokenizer.backend_tokenizer.to_str())
+        if (backend.get("pre_tokenizer") == {
+            "type": "Split", "pattern": {"String": " "},
+            "behavior": "MergedWithPrevious", "invert": False,
+        } and backend.get("normalizer") == {
+            "type": "Replace", "pattern": {"String": " "}, "content": "▁",
+        }):
+            return "gemma4"
+        return super().get_vocab_base_pre(tokenizer)
 
     def set_vocab(self):
         self._set_vocab_gpt2()
