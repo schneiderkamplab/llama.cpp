@@ -94,6 +94,7 @@ int main(int argc, char ** argv) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = n_ctx;
+    if (llama_model_is_prefix_lm(model)) { ctx_params.n_ubatch = n_ctx; }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -108,12 +109,13 @@ int main(int argc, char ** argv) {
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
+    const bool prefix_lm = llama_get_attention_type(ctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM;
 
     // helper function to evaluate a prompt and generate a response
     auto generate = [&](const std::string & prompt) {
         std::string response;
 
-        const bool is_first = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
+        const bool is_first = prefix_lm || llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
 
         // tokenize the prompt
         const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, is_first, true);
@@ -127,10 +129,11 @@ int main(int argc, char ** argv) {
         int n_tokens = prompt_tokens.size();
 
         llama_token new_token_id;
+        bool prefix = prefix_lm;
         while (true) {
             // check if we have enough space in the context to evaluate this batch
-            int n_ctx = llama_n_ctx(ctx);
-            int n_ctx_used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            int n_ctx = llama_n_ctx_seq(ctx);
+            int n_ctx_used = prefix ? 0 : llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
             if (n_ctx_used + n_tokens > n_ctx) {
                 printf("\033[0m\n");
                 fprintf(stderr, "context size exceeded\n");
@@ -140,7 +143,8 @@ int main(int argc, char ** argv) {
             // positions continue from the memory
             batch_set_tokens(batch, tokens, n_tokens, n_ctx_used);
 
-            int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+            int ret = prefix ? llama_process_prefix(ctx, batch) : llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+            prefix = false;
             if (ret != 0) {
                 GGML_ABORT("failed to decode, ret = %d\n", ret);
             }
@@ -200,7 +204,7 @@ int main(int argc, char ** argv) {
         }
 
         // remove previous messages to obtain the prompt to generate the response
-        std::string prompt(formatted.begin() + prev_len, formatted.begin() + new_len);
+        std::string prompt(formatted.begin() + (prefix_lm ? 0 : prev_len), formatted.begin() + new_len);
 
         // generate a response
         printf("\033[33m");

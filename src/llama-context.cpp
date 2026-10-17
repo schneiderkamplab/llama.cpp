@@ -14,10 +14,12 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -307,11 +309,27 @@ llama_context::llama_context(
         }
     }
 
-    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
-        cparams.causal_attn = hparams.causal_attn;
-    } else {
-        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+    attention_type = params.attention_type;
+    if (attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        attention_type = hparams.hrm_prefix_lm ? LLAMA_ATTENTION_TYPE_PREFIX_LM :
+            hparams.causal_attn ? LLAMA_ATTENTION_TYPE_CAUSAL : LLAMA_ATTENTION_TYPE_NON_CAUSAL;
     }
+    if (attention_type != LLAMA_ATTENTION_TYPE_CAUSAL && attention_type != LLAMA_ATTENTION_TYPE_NON_CAUSAL &&
+        attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        throw std::runtime_error("invalid attention type");
+    }
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (params.embeddings || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+         llama_model_has_encoder(&model) || !llama_model_has_decoder(&model) || llama_model_is_recurrent(&model) ||
+         llama_model_is_hybrid(&model) || llama_model_is_diffusion(&model) ||
+         hparams.n_swa != 0 || hparams.n_pos_per_embd() != 1)) {
+        throw std::runtime_error("PrefixLM requires token sequences and a full-attention decoder");
+    }
+    mixed_lm = params.mixed_lm;
+    if (mixed_lm && attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        throw std::runtime_error("MixedLM requires a PrefixLM context");
+    }
+    cparams.causal_attn = attention_type != LLAMA_ATTENTION_TYPE_NON_CAUSAL;
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -374,6 +392,10 @@ llama_context::llama_context(
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+    prefix_context_limit = cparams.kv_unified ? cparams.n_ctx : cparams.n_ctx / cparams.n_seq_max;
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM && prefix_context_limit == 0) {
+        throw std::runtime_error("PrefixLM context capacity per sequence is zero");
+    }
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
     if (cparams.kv_unified) {
@@ -482,6 +504,14 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+            if (!memory) { throw std::runtime_error("PrefixLM requires KV memory"); }
+            memory->prefix_lm = true;
+            memory->prefix_seq_limit = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+            memory->prefix_max_sequences = cparams.n_seq_max;
+            memory->prefix_capacity = prefix_context_limit;
+            memory->prefix_unified = cparams.kv_unified;
+        }
     }
 
     // init backends
@@ -919,7 +949,7 @@ uint32_t llama_context::n_ctx() const {
 }
 
 uint32_t llama_context::n_ctx_seq() const {
-    return cparams.n_ctx_seq;
+    return attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? prefix_context_limit : cparams.n_ctx_seq;
 }
 
 uint32_t llama_context::n_batch() const {
@@ -951,6 +981,16 @@ bool llama_context::memory_update(bool optimize) {
         return false;
     }
 
+    auto prefix_update_failed = [&]() {
+        if (memory->prefix_lm) {
+            // Pending copies may involve several sequences; none may retain uncertain KV.
+            memory->clear(true);
+            memory->prefix_reset();
+            n_outputs = 0;
+            throw std::runtime_error("PrefixLM memory update failed; context memory cleared");
+        }
+    };
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {
@@ -967,6 +1007,7 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
+                    prefix_update_failed();
                     return false;
                 }
         }
@@ -982,6 +1023,7 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            prefix_update_failed();
         }
     }
 
@@ -1497,6 +1539,25 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        const int layers = model.hparams.n_layer();
+        if (data && (n_embd != int(model.hparams.n_embd) || il_start < 1 || il_end < il_start ||
+            il_end > layers || len == 0 || len % n_embd != 0 ||
+            !std::all_of(data, data + len, [](float x) { return std::isfinite(x); }))) { return false; }
+        bool same = true;
+        for (int il = 1; il < layers; ++il) {
+            const auto * tensor = cvec->tensor_for(il);
+            const bool active = data && il >= il_start && il <= il_end;
+            if (bool(tensor) != active) { same = false; break; }
+            if (active && size_t(il) * n_embd <= len) {
+                std::vector<float> current(n_embd);
+                ggml_backend_tensor_get(tensor, current.data(), 0, current.size() * sizeof(float));
+                if (!std::equal(current.begin(), current.end(), data + (il - 1) * n_embd)) { same = false; break; }
+            }
+        }
+        if (same) { return true; }
+        if (!memory->prefix_sequences.empty()) { return false; }
+    }
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
     sched_need_reserve = true;
@@ -1580,6 +1641,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) { return -1; }
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1819,6 +1881,167 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    return attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? decode_prefix_lm(batch_inp, {}) : decode_impl(batch_inp);
+}
+
+int llama_context::decode_prefix(const llama_batch_ext & batch) {
+    if (attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM) { return -1; }
+    std::map<llama_seq_id, llama_pos> prefixes;
+    for (const auto & token : batch.tokens) {
+        for (auto seq : token.seq_ids) { ++prefixes[seq]; }
+    }
+    return decode_prefix_lm(batch, prefixes);
+}
+
+int llama_context::decode_prefix_mixed(const llama_batch_ext & batch, const llama_seq_id * ids, const llama_pos * ends, size_t count) {
+    if (attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM || count > cparams.n_seq_max || (count && (!ids || !ends))) { return -1; }
+    std::map<llama_seq_id, llama_pos> prefixes;
+    for (size_t i = 0; i < count; ++i) {
+        if (ends[i] <= 0 || !prefixes.emplace(ids[i], ends[i]).second) { return -1; }
+    }
+    return decode_prefix_lm(batch, prefixes);
+}
+
+int llama_context::decode_mixed_lm(const llama_batch_ext & batch) {
+    if (!mixed_lm || !memory || batch.tokens.empty() ||
+        batch.tokens.size() > cparams.n_ubatch || batch.tokens.size() > cparams.n_batch) { return -1; }
+    std::map<llama_seq_id, llama_pos> prefixes;
+    for (const auto & token : batch.tokens) {
+        for (auto id : token.seq_ids) {
+            const auto old = memory->prefix_sequences.find(id);
+            if (old == memory->prefix_sequences.end()) { return -1; }
+            auto entry = prefixes.emplace(id, old->second.end).first;
+            if (entry->second == std::numeric_limits<llama_pos>::max() ||
+                uint32_t(entry->second) >= prefix_context_limit) { return -1; }
+            ++entry->second;
+        }
+    }
+    return decode_prefix_lm(batch, prefixes, true);
+}
+
+int llama_context::decode_prefix_lm(const llama_batch_ext & batch, const std::map<llama_seq_id, llama_pos> & prefixes, bool extend) {
+    const bool prefix = !prefixes.empty();
+    if (!batch.embd.empty() || !batch.state.empty() || batch.tokens.empty() ||
+        uint32_t(batch.tokens.size()) > cparams.n_batch ||
+        (prefix && uint32_t(batch.tokens.size()) > cparams.n_ubatch)) {
+        LLAMA_LOG_ERROR("%s: invalid PrefixLM batch or capacity\n", __func__);
+        return -1;
+    }
+    std::set<llama_seq_id> touched;
+    bool executing = false;
+    auto reset = [&] {
+        synchronize();
+        for (const auto seq : touched) {
+            memory->seq_rm(seq, 0, -1);
+            memory->prefix_sequences.erase(seq);
+        }
+        n_outputs = 0;
+        memory->prefix_batch = false;
+        set_causal_attn(true);
+    };
+    try {
+        auto next = memory->prefix_sequences;
+        std::map<llama_seq_id, llama_pos> retained_ends;
+        if (extend) {
+            for (const auto & entry : prefixes) { retained_ends[entry.first] = next.at(entry.first).end; }
+        }
+        const auto prefix_start = [&](llama_seq_id id) { return extend ? retained_ends.at(id) : 0; };
+        std::vector<llama_pos> positions(batch.tokens.size());
+        const auto seq_limit = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+        std::map<llama_seq_id, std::vector<int32_t>> rows;
+        int64_t shared_rows = 0;
+        for (int32_t i = 0; i < batch.tokens.size(); ++i) {
+            const auto & token = batch.tokens[i];
+            const auto count = token.seq_ids.size();
+            if (count == 0 || count > cparams.n_seq_max || (count > 1 && !memory->prefix_unified) ||
+                token.has_embd || token.has_state || token.decision_order != 0 ||
+                token.id < 0 || uint32_t(token.id) >= model.vocab.n_tokens()) { return -1; }
+            bool first = true;
+            for (auto seq : token.seq_ids) {
+                if (seq < 0 || uint32_t(seq) >= seq_limit) { return -1; }
+                if (touched.insert(seq).second) {
+                    if (prefixes.count(seq)) { next[seq] = {prefixes.at(seq), prefix_start(seq), {}}; }
+                    else if (!next.count(seq)) { return -1; }
+                }
+                auto & state = next.at(seq);
+                if (uint32_t(state.next) >= prefix_context_limit || (token.pos[0] != state.next) ||
+                    (!first && positions[i] != state.next)) { return -1; }
+                positions[i] = state.next++;
+                first = false;
+                rows[seq].push_back(i);
+            }
+            shared_rows += count - 1;
+        }
+        // Shared queries must see identical past keys and the same complete prefix.
+        std::map<std::pair<llama_seq_id, llama_seq_id>, size_t> checked;
+        for (int32_t i = 0; i < batch.tokens.size(); ++i) {
+            const auto & owners = batch.tokens[i].seq_ids;
+            const auto a = *owners.begin();
+            for (auto b : owners) {
+                if (a == b) { continue; }
+                if (prefixes.count(a) != prefixes.count(b) || next.at(a).end != next.at(b).end) { return -1; }
+                const llama_pos start_a = prefixes.count(a) ? prefix_start(a) : memory->prefix_sequences.at(a).next;
+                const llama_pos start_b = prefixes.count(b) ? prefix_start(b) : memory->prefix_sequences.at(b).next;
+                if (start_a != start_b) { return -1; }
+                const auto key = std::make_pair(std::min(a, b), std::max(a, b));
+                const auto previous = checked.emplace(key, 0);
+                if (previous.second && !memory->prefix_same(a, b, start_a)) { return -1; }
+                const size_t n = std::max(next.at(a).end, positions[i] + 1) - start_a;
+                auto & verified = previous.first->second;
+                if (rows[a].size() < n || rows[b].size() < n) { return -1; }
+                if (n > verified) {
+                    if (!std::equal(rows[a].begin() + verified, rows[a].begin() + n, rows[b].begin() + verified)) { return -1; }
+                    verified = n;
+                }
+            }
+        }
+        std::set<llama_seq_id> replaced;
+        for (const auto & entry : prefixes) {
+            if (!touched.count(entry.first) || next.at(entry.first).next < entry.second) { return -1; }
+            replaced.insert(entry.first);
+        }
+        if (!memory->prefix_valid(next) || (memory->prefix_unified &&
+            memory->prefix_used(next, replaced, -1, retained_ends) - shared_rows > prefix_context_limit)) { return -1; }
+        executing = true;
+        for (const auto id : replaced) {
+            if (!memory->seq_rm(id, prefix_start(id), -1)) { reset(); return -3; }
+        }
+        memory->prefix_sequences = next; // mask construction needs boundaries before graph execution
+        memory->prefix_batch = prefix;
+        set_causal_attn(true);
+        const int result = decode_impl(batch);
+        synchronize();
+        memory->prefix_batch = false;
+        set_causal_attn(true);
+        if (result != 0 || (abort_callback && abort_callback(abort_callback_data))) {
+            reset();
+            return result != 0 ? result : 2;
+        }
+        std::map<llama_seq_id, int32_t> last;
+        for (const auto & entry : rows) { last[entry.first] = entry.second.back(); }
+        std::map<int32_t, std::shared_ptr<const std::vector<float>>> saved_rows;
+        for (const auto & entry : last) {
+            auto & saved = next.at(entry.first).logits;
+            saved.reset();
+            if (logits.data && batch.tokens[entry.second].output) {
+                auto & shared = saved_rows[entry.second];
+                if (!shared) {
+                    const auto * row = get_logits_ith(entry.second);
+                    shared = std::make_shared<const std::vector<float>>(row, row + model.vocab.n_tokens());
+                }
+                saved = shared;
+            }
+        }
+        memory->prefix_sequences = std::move(next);
+        return 0;
+    } catch (const std::exception & error) {
+        if (executing) { reset(); }
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return -3;
+    }
+}
+
+int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -3398,11 +3621,19 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 }
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
+static constexpr uint32_t io_magic_prefix = 0xaf143cd9;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (seq_id < 0 || uint32_t(seq_id) >= memory->prefix_seq_limit)) { return 0; }
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM && flags != 0) {
+        LLAMA_LOG_ERROR("%s: PrefixLM persistence requires complete host state (flags = 0)\n", __func__);
+        return 0;
+    }
+    const uint32_t state_magic = attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? io_magic_prefix : io_magic;
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
+        io.write(&state_magic, sizeof(state_magic));
         io.write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(io, seq_id, flags);
@@ -3413,6 +3644,13 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (seq_id < 0 || uint32_t(seq_id) >= memory->prefix_seq_limit)) { return 0; }
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM && flags != 0) {
+        LLAMA_LOG_ERROR("%s: PrefixLM persistence requires complete host state (flags = 0)\n", __func__);
+        return 0;
+    }
+    const uint32_t state_magic = attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? io_magic_prefix : io_magic;
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3421,7 +3659,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
+        io->write(&state_magic, sizeof(state_magic));
         io->write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(*io, seq_id, flags);
@@ -3432,6 +3670,13 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (seq_id < 0 || uint32_t(seq_id) >= memory->prefix_seq_limit)) { return 0; }
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM && flags != 0) {
+        LLAMA_LOG_ERROR("%s: PrefixLM persistence requires complete host state (flags = 0)\n", __func__);
+        return 0;
+    }
+    const uint32_t state_magic = attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? io_magic_prefix : io_magic;
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3439,7 +3684,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (state_magic != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3456,7 +3701,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (state_magic != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3479,7 +3724,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
+        if (magic != LLAMA_SESSION_MAGIC || version != (LLAMA_SESSION_VERSION + (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? 0x10000u : 0u))) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for session file: %08x, %08x\n", __func__, magic, version);
             return false;
         }
@@ -3518,7 +3763,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
-    file.write_u32(LLAMA_SESSION_VERSION);
+    file.write_u32(LLAMA_SESSION_VERSION + (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? 0x10000u : 0u));
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
@@ -3532,6 +3777,8 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 }
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (seq_id < 0 || uint32_t(seq_id) >= memory->prefix_seq_limit)) { return 0; }
     llama_file file(filepath, "rb");
 
     // version checks
@@ -3539,7 +3786,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != (LLAMA_STATE_SEQ_VERSION + (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? 0x10000u : 0u))) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
             return 0;
         }
@@ -3586,10 +3833,12 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM &&
+        (seq_id < 0 || uint32_t(seq_id) >= memory->prefix_seq_limit)) { return 0; }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    file.write_u32(LLAMA_STATE_SEQ_VERSION + (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? 0x10000u : 0u));
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
@@ -3605,7 +3854,151 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+// State stores adapter identity, not weights: callers load the same model and adapters first.
+uint64_t llama_context::prefix_adapter_signature() const {
+    std::vector<uint64_t> signatures;
+    for (const auto & entry : *loras) {
+        uint64_t hash = 14695981039346656037ull;
+        auto add = [&](const void * data, size_t size) {
+            const auto * bytes = static_cast<const uint8_t *>(data);
+            for (size_t i = 0; i < size; ++i) { hash = (hash ^ bytes[i]) * 1099511628211ull; }
+        };
+        add(&entry.second, sizeof(entry.second));
+        add(&entry.first->alpha, sizeof(entry.first->alpha));
+        std::map<std::string, llama_adapter_lora_weight> weights(entry.first->ab_map.begin(), entry.first->ab_map.end());
+        for (const auto & weight : weights) {
+            add(weight.first.c_str(), weight.first.size() + 1);
+            for (const auto * tensor : {weight.second.a, weight.second.b}) {
+                add(&tensor->type, sizeof(tensor->type));
+                add(tensor->ne, sizeof(tensor->ne));
+                std::vector<uint8_t> data(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+                add(data.data(), data.size());
+            }
+        }
+        signatures.push_back(hash);
+    }
+    std::sort(signatures.begin(), signatures.end());
+    uint64_t result = 0;
+    for (uint64_t hash : signatures) { result = result * 1099511628211ull ^ hash; }
+    for (uint32_t il = 1; il < model.hparams.n_layer(); ++il) {
+        const auto * tensor = cvec->tensor_for(il);
+        if (!tensor) { continue; }
+        result = result * 1099511628211ull ^ il;
+        std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+        for (uint8_t byte : bytes) { result = (result ^ byte) * 1099511628211ull; }
+    }
+    return result;
+}
+
+size_t llama_context::prefix_state_write(llama_io_write_i & io, llama_seq_id seq_id) {
+    if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= memory->prefix_seq_limit)) {
+        throw std::runtime_error("invalid PrefixLM state sequence");
+    }
+    // Cross-stream forks defer their buffer copies until a memory update.
+    memory_update(false);
+    synchronize();
+    const uint32_t version = mixed_lm ? 3 : 2;
+    const uint64_t signature = prefix_adapter_signature();
+    const auto & states = memory->prefix_sequences;
+    const uint32_t count = seq_id < 0 ? states.size() : states.count(seq_id);
+    io.write(&version, sizeof(version));
+    io.write(&signature, sizeof(signature));
+    io.write(&count, sizeof(count));
+    for (const auto & entry : states) {
+        if (seq_id >= 0 && seq_id != entry.first) { continue; }
+        io.write(&entry.first, sizeof(entry.first));
+        io.write(&entry.second.end, sizeof(entry.second.end));
+        io.write(&entry.second.next, sizeof(entry.second.next));
+    }
+    memory->state_write(io, seq_id);
+    for (const auto & entry : states) {
+        if (seq_id >= 0 && seq_id != entry.first) { continue; }
+        const auto & rows = entry.second.logits;
+        const uint32_t size = rows ? rows->size() : 0;
+        io.write(&size, sizeof(size));
+        if (size) { io.write(rows->data(), size * sizeof(float)); }
+    }
+    return io.n_bytes();
+}
+
+size_t llama_context::prefix_state_read(llama_io_read_i & io, llama_seq_id seq_id) {
+    if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= memory->prefix_seq_limit)) {
+        throw std::runtime_error("invalid PrefixLM state sequence");
+    }
+    uint32_t version, count;
+    uint64_t signature;
+    io.read(&version, sizeof(version));
+    io.read(&signature, sizeof(signature));
+    io.read(&count, sizeof(count));
+    if (version != (mixed_lm ? 3u : 2u) || signature != prefix_adapter_signature() ||
+        count > (seq_id < 0 ? memory->prefix_max_sequences : 1u)) {
+        throw std::runtime_error("incompatible PrefixLM state version, adapters or sequence count");
+    }
+    auto next = seq_id < 0 ? llama_memory_i::prefix_states{} : memory->prefix_sequences;
+    if (seq_id >= 0) { next.erase(seq_id); }
+    for (uint32_t i = 0; i < count; ++i) {
+        llama_seq_id id;
+        llama_memory_i::prefix_state state;
+        io.read(&id, sizeof(id));
+        io.read(&state.end, sizeof(state.end));
+        io.read(&state.next, sizeof(state.next));
+        if (id < 0 || uint32_t(id) >= LLAMA_MAX_SEQ || !next.emplace(seq_id < 0 ? id : seq_id, state).second) {
+            throw std::runtime_error("invalid PrefixLM sequence metadata");
+        }
+    }
+    if (!memory->prefix_valid(next) || (seq_id >= 0 && memory->prefix_unified &&
+        memory->prefix_used(next, {seq_id}) > prefix_context_limit)) {
+        throw std::runtime_error("PrefixLM state exceeds context capacity");
+    }
+    memory_update(false);
+    synchronize();
+    try {
+        // Empty sequence state also replaces an existing destination.
+        if (seq_id >= 0) { memory->seq_rm(seq_id, 0, -1); }
+        memory->state_read(io, seq_id);
+        for (auto & entry : next) {
+            if (seq_id >= 0 && seq_id != entry.first) { continue; }
+            uint32_t size;
+            io.read(&size, sizeof(size));
+            if (size != 0 && size != model.vocab.n_tokens()) { throw std::runtime_error("invalid saved logits size"); }
+            if (size) {
+                auto row = std::make_shared<std::vector<float>>(size);
+                io.read(row->data(), size * sizeof(float));
+                if (!std::all_of(row->begin(), row->end(), [](float x) { return std::isfinite(x); })) {
+                    throw std::runtime_error("nonfinite saved logits");
+                }
+                entry.second.logits = std::move(row);
+            }
+        }
+        for (uint32_t id = 0; id < memory->prefix_seq_limit; ++id) {
+            if (seq_id >= 0 && id != uint32_t(seq_id)) { continue; }
+            const auto it = next.find(id);
+            const llama_pos end = it == next.end() ? -1 : it->second.next - 1;
+            if (memory->seq_pos_max(id) != end || (end >= 0 && memory->seq_pos_min(id) != 0)) {
+                throw std::runtime_error("PrefixLM metadata does not match KV positions");
+            }
+        }
+        if (memory->prefix_unified && memory->prefix_used(next) > prefix_context_limit) {
+            throw std::runtime_error("restored PrefixLM KV exceeds requested capacity");
+        }
+        memory->prefix_sequences = std::move(next);
+        n_outputs = 0;
+    } catch (...) {
+        if (seq_id < 0) { memory->clear(true); memory->prefix_reset(); }
+        else { memory->seq_rm(seq_id, 0, -1); memory->prefix_sequences.erase(seq_id); }
+        n_outputs = 0;
+        throw;
+    }
+    return io.n_bytes();
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        io.write_string(std::string(llm_arch_name(model.arch)) + ":prefix-lm-v2");
+        return prefix_state_write(io, -1);
+    }
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -3626,6 +4019,14 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        std::string arch;
+        io.read_string(arch);
+        if (arch != std::string(llm_arch_name(model.arch)) + ":prefix-lm-v2") {
+            throw std::runtime_error("incompatible PrefixLM context state");
+        }
+        return prefix_state_read(io, -1);
+    }
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -3652,6 +4053,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        return prefix_state_write(io, seq_id);
+    }
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -3660,6 +4064,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        return prefix_state_read(io, seq_id);
+    }
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4010,6 +4417,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.mixed_lm                    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4196,10 +4604,18 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
+    if (embeddings && ctx->get_attention_type() == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        LLAMA_LOG_ERROR("%s: PrefixLM does not support embedding output\n", __func__);
+        return;
+    }
     ctx->set_embeddings(embeddings);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+    if (ctx->get_attention_type() == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        LLAMA_LOG_ERROR("%s: PrefixLM attention is controlled by the decode API\n", __func__);
+        return;
+    }
     ctx->set_causal_attn(causal_attn);
 }
 
@@ -4213,6 +4629,13 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+const float * llama_get_logits_seq(llama_context * ctx, llama_seq_id seq_id) {
+    auto * memory = ctx->get_memory();
+    if (!memory || !memory->prefix_lm) { return nullptr; }
+    const auto it = memory->prefix_sequences.find(seq_id);
+    return it == memory->prefix_sequences.end() || !it->second.logits ? nullptr : it->second.logits->data();
 }
 
 float * llama_get_logits(llama_context * ctx) {
@@ -4361,6 +4784,19 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
+    if (ctx->get_attention_type() == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        for (size_t i = 0; i < n_adapters; ++i) {
+            if (!adapters[i] || adapters[i]->model != &ctx->get_model() || !std::isfinite(scales[i]) ||
+                (scales[i] != 0 && !adapters[i]->alora_invocation_tokens.empty())) {
+                LLAMA_LOG_ERROR("%s: PrefixLM requires fixed, finite-scale LoRA adapters\n", __func__);
+                return -1;
+            }
+        }
+        if (!ctx->get_memory()->prefix_sequences.empty() && !ctx->adapters_lora_are_same(adapters, n_adapters, scales)) {
+            LLAMA_LOG_ERROR("%s: clear PrefixLM memory before changing adapters\n", __func__);
+            return -1;
+        }
+    }
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
@@ -4388,6 +4824,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     }
 
     mem->clear(data);
+    mem->prefix_reset();
 }
 
 bool llama_memory_seq_rm(
@@ -4399,6 +4836,33 @@ bool llama_memory_seq_rm(
         return true;
     }
 
+    if (mem->prefix_lm) {
+        const llama_pos begin = std::max<llama_pos>(0, p0);
+        const llama_pos end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+        if (end <= begin) { return true; }
+        for (const auto & entry : mem->prefix_sequences) {
+            if (seq_id >= 0 && entry.first != seq_id) { continue; }
+            const auto & state = entry.second;
+            if (begin >= state.next || (begin == 0 && end >= state.next)) { continue; }
+            if (begin < state.end || end < state.next) {
+                LLAMA_LOG_ERROR("%s: PrefixLM removal must clear a sequence or trim an answer suffix\n", __func__);
+                return false;
+            }
+        }
+        if (!mem->seq_rm(seq_id, p0, p1)) { return false; }
+        for (auto it = mem->prefix_sequences.begin(); it != mem->prefix_sequences.end();) {
+            if ((seq_id < 0 || it->first == seq_id) && begin < it->second.next) {
+                if (begin == 0) {
+                    it = mem->prefix_sequences.erase(it);
+                    continue;
+                }
+                it->second.next = begin;
+                it->second.logits.reset(); // boundary changed; callers must recompute or restore it
+            }
+            ++it;
+        }
+        return true;
+    }
     return mem->seq_rm(seq_id, p0, p1);
 }
 
@@ -4412,6 +4876,41 @@ void llama_memory_seq_cp(
         return;
     }
 
+    if (mem->prefix_lm) {
+        if (seq_id_src == seq_id_dst) { return; }
+        const auto source = mem->prefix_sequences.find(seq_id_src);
+        if (source == mem->prefix_sequences.end() || seq_id_dst < 0 || uint32_t(seq_id_dst) >= mem->prefix_seq_limit) { return; }
+        const auto begin = std::max<llama_pos>(0, p0);
+        const auto end = p1 < 0 ? source->second.next : std::min(p1, source->second.next);
+        if (begin >= end) { return; }
+        if (end < source->second.end) {
+            LLAMA_LOG_ERROR("%s: cannot copy an incomplete bidirectional prefix\n", __func__);
+            return;
+        }
+        if (begin > 0) {
+            const auto dest = mem->prefix_sequences.find(seq_id_dst);
+            if (begin < source->second.end || dest == mem->prefix_sequences.end() ||
+                dest->second.end != source->second.end || dest->second.next < begin ||
+                !mem->prefix_same(seq_id_src, seq_id_dst, begin)) {
+                LLAMA_LOG_ERROR("%s: copied answer range needs identical preceding KV\n", __func__);
+                return;
+            }
+        }
+        auto next = mem->prefix_sequences;
+        next[seq_id_dst] = source->second;
+        next[seq_id_dst].next = end;
+        if (end != source->second.next) { next[seq_id_dst].logits.reset(); }
+        if (!mem->prefix_valid(next) || (mem->prefix_unified &&
+            mem->prefix_used(next, {seq_id_dst}, seq_id_dst) > mem->prefix_capacity)) {
+            LLAMA_LOG_ERROR("%s: PrefixLM copy exceeds sequence or context capacity\n", __func__);
+            return;
+        }
+        mem->seq_rm(seq_id_dst, 0, -1);
+        mem->seq_cp(seq_id_src, seq_id_dst, 0, -1);
+        if (end < source->second.next) { mem->seq_rm(seq_id_dst, end, -1); }
+        mem->prefix_sequences = std::move(next);
+        return;
+    }
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -4423,6 +4922,12 @@ void llama_memory_seq_keep(
     }
 
     mem->seq_keep(seq_id);
+    if (mem->prefix_lm) {
+        for (auto it = mem->prefix_sequences.begin(); it != mem->prefix_sequences.end();) {
+            if (mem->seq_pos_max(it->first) < 0) { it = mem->prefix_sequences.erase(it); }
+            else { ++it; }
+        }
+    }
 }
 
 void llama_memory_seq_add(
@@ -4435,6 +4940,10 @@ void llama_memory_seq_add(
         return;
     }
 
+    if (mem->prefix_lm) {
+        LLAMA_LOG_ERROR("%s: operation is not supported for PrefixLM\n", __func__);
+        return;
+    }
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -4448,6 +4957,10 @@ void llama_memory_seq_div(
         return;
     }
 
+    if (mem->prefix_lm) {
+        LLAMA_LOG_ERROR("%s: operation is not supported for PrefixLM\n", __func__);
+        return;
+    }
     mem->seq_div(seq_id, p0, p1, d);
 }
 
@@ -4476,7 +4989,7 @@ bool llama_memory_can_shift(llama_memory_t mem) {
         return false;
     }
 
-    return mem->get_can_shift();
+    return !mem->prefix_lm && mem->get_can_shift();
 }
 
 // llama state API
@@ -4599,13 +5112,75 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 // compat: llama_batch -> llama_batch_ext -> encode/decode
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) { return -1; }
     llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
     return encode(*compat.batch_ext);
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        llama_batch_ext batch(this);
+        if (!prepare_prefix_batch(batch_inp, batch, {}, false)) { return -1; }
+        return decode(batch);
+    }
     llama_batch_compat compat(this, batch_inp);
     return decode(*compat.batch_ext);
+}
+
+bool llama_context::prepare_prefix_batch(const llama_batch & input, llama_batch_ext & batch,
+        const std::set<llama_seq_id> & starts, bool extend, bool all) {
+    if (attention_type != LLAMA_ATTENTION_TYPE_PREFIX_LM || !memory || !input.token || input.embd ||
+        input.n_tokens <= 0 || uint32_t(input.n_tokens) > cparams.n_batch) { return false; }
+    std::map<llama_seq_id, llama_pos> next;
+    const auto limit = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    for (int32_t i = 0; i < input.n_tokens; ++i) {
+        llama_batch_ext::token token;
+        token.id = input.token[i];
+        token.output = input.logits ? input.logits[i] != 0 : i == input.n_tokens - 1;
+        const int count = input.n_seq_id ? input.n_seq_id[i] : 1;
+        if (count <= 0 || uint32_t(count) > cparams.n_seq_max ||
+            (count > 1 && !input.seq_id) || (input.seq_id && !input.seq_id[i])) { return false; }
+        for (int j = 0; j < count; ++j) {
+            const auto id = input.seq_id ? input.seq_id[i][j] : 0;
+            if (id < 0 || uint32_t(id) >= limit || !token.seq_ids.insert(id).second) { return false; }
+            if (!next.count(id)) {
+                const auto old = memory->prefix_sequences.find(id);
+                if (extend || !(all || starts.count(id))) {
+                    if (old == memory->prefix_sequences.end()) { return false; }
+                    next[id] = extend ? old->second.end : old->second.next;
+                } else {
+                    next[id] = 0;
+                }
+            }
+            auto & position = next.at(id);
+            if (position < 0 || uint32_t(position) >= prefix_context_limit ||
+                (input.pos && input.pos[i] != position) || (j > 0 && token.pos[0] != position)) { return false; }
+            token.pos[0] = position++;
+        }
+        batch.tokens.push_back(std::move(token));
+    }
+    return true;
+}
+
+int llama_context::decode_prefix(const llama_batch & input) {
+    llama_batch_ext batch(this);
+    if (!prepare_prefix_batch(input, batch, {}, false, true)) { return -1; }
+    return decode_prefix(batch);
+}
+
+int llama_context::decode_prefix_mixed(const llama_batch & input, const llama_seq_id * ids, const llama_pos * ends, size_t count) {
+    if (count > cparams.n_seq_max || (count && (!ids || !ends))) { return -1; }
+    llama_batch_ext batch(this);
+    std::set<llama_seq_id> starts;
+    for (size_t i = 0; i < count; ++i) { starts.insert(ids[i]); }
+    if (!prepare_prefix_batch(input, batch, starts, false)) { return -1; }
+    return decode_prefix_mixed(batch, ids, ends, count);
+}
+
+int llama_context::decode_mixed_lm(const llama_batch & input) {
+    llama_batch_ext batch(this);
+    if (!prepare_prefix_batch(input, batch, {}, true)) { return -1; }
+    return decode_mixed_lm(batch);
 }
 
 ///
@@ -4716,4 +5291,34 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+llama_attention_type llama_get_attention_type(const llama_context * ctx) {
+    return ctx->get_attention_type();
+}
+
+int32_t llama_decode_prefix_mixed(llama_context * ctx, llama_batch batch,
+                                const llama_seq_id * ids, const llama_pos * ends, size_t count) {
+    return ctx->decode_prefix_mixed(batch, ids, ends, count);
+}
+
+int32_t llama_decode_prefix(llama_context * ctx, llama_batch batch) {
+    return ctx->decode_prefix(batch);
+}
+
+int32_t llama_decode_mixed_lm(llama_context * ctx, llama_batch batch) {
+    return ctx->decode_mixed_lm(batch);
+}
+
+int32_t llama_process_prefix(llama_context * ctx, const llama_batch_ext * batch) {
+    return batch ? ctx->decode_prefix(*batch) : -1;
+}
+
+int32_t llama_process_prefix_mixed(llama_context * ctx, const llama_batch_ext * batch,
+        const llama_seq_id * ids, const llama_pos * ends, size_t count) {
+    return batch ? ctx->decode_prefix_mixed(*batch, ids, ends, count) : -1;
+}
+
+int32_t llama_process_mixed_lm(llama_context * ctx, const llama_batch_ext * batch) {
+    return batch ? ctx->decode_mixed_lm(*batch) : -1;
 }

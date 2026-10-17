@@ -616,7 +616,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool whole_sequences) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -648,6 +648,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
         }
 
+        // A bidirectional prefix cannot be split because another stream is shorter.
+        if (whole_sequences && !cur_seq_set.empty()) {
+            add = add && seq_set_map[cur_seq_set.front()].size() == seq_set_map[seq_set[i]].size();
+        }
         if (add) {
             cur_seq_set.push_back(seq_set[i]);
 
@@ -1159,7 +1163,7 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_embd_inp(llama_batch_ext_select_n_embd_inp(ctx->get_cparams().ctx_type, llama_get_model(ctx)->arch, llama_get_model(ctx)->hparams)),
         n_embd_inp_enc(llama_get_model(ctx)->hparams.n_embd_inp_enc()),
         n_embd_state(llama_batch_ext_select_n_embd_state(ctx->get_cparams().ctx_type, llama_get_model(ctx)->hparams)),
-        n_seq_max(llama_n_seq_max(ctx)),
+        n_seq_max(ctx->get_attention_type() == LLAMA_ATTENTION_TYPE_PREFIX_LM && ctx->get_cparams().kv_unified ? LLAMA_MAX_SEQ : llama_n_seq_max(ctx)),
         mem(llama_get_memory(ctx)),
         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
         n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {

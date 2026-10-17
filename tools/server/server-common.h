@@ -706,3 +706,5 @@ private:
     intptr_t out_handles[SERVER_SUBPROC_STREAMS] = { -1, -1 }; // fd on POSIX, HANDLE on Windows; taken lazily from sproc
     bool     out_closed [SERVER_SUBPROC_STREAMS] = { false, false };
 };
+
+std::vector<llama_token_data> get_token_probabilities(const float * logits, const llama_token * sampled_ids, int n_logits, size_t n_top);

@@ -148,9 +148,20 @@ struct llama_context {
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
 
+    int decode_prefix(const llama_batch_ext & batch);
+    int decode_prefix_mixed(const llama_batch_ext & batch, const llama_seq_id * ids, const llama_pos * ends, size_t count);
+    int decode_mixed_lm(const llama_batch_ext & batch);
+
     // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_prefix(const llama_batch & batch_inp);
+    int decode_prefix_mixed(const llama_batch & batch, const llama_seq_id * ids, const llama_pos * ends, size_t count);
+    int decode_mixed_lm(const llama_batch & batch);
+    llama_attention_type get_attention_type() const {
+        return attention_type == LLAMA_ATTENTION_TYPE_PREFIX_LM ? attention_type :
+            cparams.causal_attn ? LLAMA_ATTENTION_TYPE_CAUSAL : LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+    }
 
     //
     // state save/load
@@ -286,6 +297,10 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    uint64_t prefix_adapter_signature() const;
+    size_t prefix_state_write(llama_io_write_i & io, llama_seq_id seq_id);
+    size_t prefix_state_read(llama_io_read_i & io, llama_seq_id seq_id);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -308,6 +323,13 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_attention_type attention_type = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
+    bool mixed_lm = false;
+    uint32_t prefix_context_limit = 0;
+    bool prepare_prefix_batch(const llama_batch & input, llama_batch_ext & batch,
+            const std::set<llama_seq_id> & starts, bool extend, bool all = false);
+    int decode_impl(const llama_batch_ext & batch_inp);
+    int decode_prefix_lm(const llama_batch_ext & batch_inp, const std::map<llama_seq_id, llama_pos> & prefixes, bool extend = false);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

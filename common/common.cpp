@@ -1523,7 +1523,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (llama_get_attention_type(lctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+                llama_process_prefix(lctx, batch.get());
+            } else {
+                llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1568,6 +1572,9 @@ char * common_get_model_or_exit(int argc, char * argv[]) {
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    if (llama_get_attention_type(ctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1666,7 +1673,9 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
         scales.push_back(la.scale);
     }
 
-    llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+    if (llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data()) != 0) {
+        throw std::runtime_error("failed to set LoRA adapters");
+    }
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -2307,6 +2316,17 @@ bool common_prompt_batch_decode(
                                int   n_batch,
                   std::string_view   state_path,
                               bool   save_state) {
+    if (llama_get_attention_type(ctx) == LLAMA_ATTENTION_TYPE_PREFIX_LM) {
+        if (save_state || n_past != 0 || n_new != int(all_tokens.size())) {
+            COM_ERR("%s", "PrefixLM requires the full prompt without cache reuse or state saving\n");
+            return false;
+        }
+        if (llama_decode_prefix(ctx, llama_batch_get_one(const_cast<llama_token *>(all_tokens.data()), n_new))) {
+            return false;
+        }
+        n_past = n_new;
+        return true;
+    }
     if (n_new == 0) {
         return true;
     }
