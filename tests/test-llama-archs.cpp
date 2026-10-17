@@ -1610,7 +1610,7 @@ static int test_prefix_lm(const llm_arch arch, size_t seed) {
             llama_memory_seq_keep(mem, 0);
             llama_memory_seq_cp(mem, 0, 0, 1, 3);
             require(llama_memory_seq_pos_max(mem, 0) == next - 1, "safe memory operations preserve positions");
-            for (const auto range : std::vector<std::pair<int, int>>{{0, -1}, {-1, next}, {0, next + 10}}) {
+            for (const auto & range : std::vector<std::pair<int, int>>{{0, -1}, {-1, next}, {0, next + 10}}) {
                 const int trim = input.size() + 1;
                 require(llama_memory_seq_rm(mem, range.first, trim, range.second), "answer suffix removed");
                 require(llama_memory_seq_pos_max(mem, 0) == trim - 1, "suffix positions updated");
