@@ -1750,13 +1750,16 @@ class TextModel(ModelBase):
 
         return seems_special
 
+    def load_vocab_tokenizer(self):
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(self.dir_model)
+
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        tokenizer = self.load_vocab_tokenizer()
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
         assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
 
@@ -1766,6 +1769,11 @@ class TextModel(ModelBase):
         added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
 
         added_tokens_decoder = tokenizer.added_tokens_decoder  # ty: ignore[unresolved-attribute]
+        tokenizer_path = self.dir_model / "tokenizer.json"
+        byte_fallback = False
+        if tokenizer_path.is_file():
+            with tokenizer_path.open(encoding="utf-8") as stream:
+                byte_fallback = json.load(stream).get("model", {}).get("byte_fallback", False)
 
         for i in range(vocab_size):
             if i not in reverse_vocab:
@@ -1789,6 +1797,8 @@ class TextModel(ModelBase):
                         # Encoding and decoding the tokens above isn't sufficient for this case.
                         token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")  # pre-normalize user-defined spaces
                         toktypes.append(gguf.TokenType.USER_DEFINED)
+                elif byte_fallback and re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token):
+                    toktypes.append(gguf.TokenType.BYTE)
                 else:
                     toktypes.append(gguf.TokenType.NORMAL)
                 tokens.append(token)
@@ -1883,7 +1893,7 @@ class TextModel(ModelBase):
             res = "lfm2"
         if chkhsh == "846deafc5b0fa786186fa4ae6c7b49903cf2f1d1895bdb80b9120d60be135252":
             # ref: https://huggingface.co/danish-foundation-models/DFM-Mimir
-            res = "gemma4"
+            res = "spm-bpe-mistral"
         if chkhsh == "0a766d034107bc736a3f2dc4968fd62e54a3570f1454443e0c5a4cc6bd7941ed":
             # ref: https://huggingface.co/XHToken/Spark-X2.5-1.7B
             res = "spark2_5"
