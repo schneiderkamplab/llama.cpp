@@ -1922,11 +1922,13 @@ int llama_context::decode_mixed_lm(const llama_batch_ext & batch) {
 int llama_context::decode_prefix_lm(const llama_batch_ext & batch, const std::map<llama_seq_id, llama_pos> & prefixes, bool extend) {
     const bool prefix = !prefixes.empty();
     if (!batch.embd.empty() || !batch.state.empty() || batch.tokens.empty() ||
-        uint32_t(batch.tokens.size()) > cparams.n_batch ||
-        (prefix && uint32_t(batch.tokens.size()) > cparams.n_ubatch)) {
+        batch.tokens.size() > size_t(std::numeric_limits<int32_t>::max()) ||
+        batch.tokens.size() > cparams.n_batch ||
+        (prefix && batch.tokens.size() > cparams.n_ubatch)) {
         LLAMA_LOG_ERROR("%s: invalid PrefixLM batch or capacity\n", __func__);
         return -1;
     }
+    const int32_t n_tokens = int32_t(batch.tokens.size());
     std::set<llama_seq_id> touched;
     bool executing = false;
     auto reset = [&] {
@@ -1950,7 +1952,7 @@ int llama_context::decode_prefix_lm(const llama_batch_ext & batch, const std::ma
         const auto seq_limit = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
         std::map<llama_seq_id, std::vector<int32_t>> rows;
         int64_t shared_rows = 0;
-        for (int32_t i = 0; i < batch.tokens.size(); ++i) {
+        for (int32_t i = 0; i < n_tokens; ++i) {
             const auto & token = batch.tokens[i];
             const auto count = token.seq_ids.size();
             if (count == 0 || count > cparams.n_seq_max || (count > 1 && !memory->prefix_unified) ||
@@ -1974,7 +1976,7 @@ int llama_context::decode_prefix_lm(const llama_batch_ext & batch, const std::ma
         }
         // Shared queries must see identical past keys and the same complete prefix.
         std::map<std::pair<llama_seq_id, llama_seq_id>, size_t> checked;
-        for (int32_t i = 0; i < batch.tokens.size(); ++i) {
+        for (int32_t i = 0; i < n_tokens; ++i) {
             const auto & owners = batch.tokens[i].seq_ids;
             const auto a = *owners.begin();
             for (auto b : owners) {
